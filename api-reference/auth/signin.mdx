@@ -1,0 +1,121 @@
+---
+title: "Sign in with email"
+description: "Authenticate an existing Apollo account using an email address or username, and a password."
+---
+
+<Badge color="blue">POST</Badge> `/api/auth/signin`
+
+Verifies the supplied credentials against an existing email-based account and issues a new session cookie. The `UserIdentifier` field accepts either the account's email address or its username.
+
+## Authentication
+
+None required. This endpoint is public.
+
+---
+
+## Request body
+
+<ParamField body="UserIdentifier" type="string" required>
+  The user's email address **or** username. Must not be empty.
+</ParamField>
+
+<ParamField body="Password" type="string" required>
+  The account password. Must not be empty.
+</ParamField>
+
+---
+
+## Response
+
+Returns a `UserDataResponse` object on success (`200 OK`).
+
+<ResponseField name="id" type="string" required>
+  UUID (version 7) uniquely identifying the user.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  Email address associated with the account.
+</ResponseField>
+
+<ResponseField name="username" type="string">
+  Display name for the user. May be `null` if not set.
+</ResponseField>
+
+<ResponseField name="avatarUrl" type="string">
+  URL of the user's avatar image. Empty string if none has been set.
+</ResponseField>
+
+<ResponseField name="isEmailConfirmed" type="boolean" required>
+  Whether the user has confirmed their email address.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 timestamp of when the account was created (UTC).
+</ResponseField>
+
+<ResponseField name="authProvider" type="string" required>
+  Authentication method used. For email accounts this value is `"Email"`.
+</ResponseField>
+
+<Note>
+  A `apollo_access_token` HTTP-only cookie is set on the response with a 14-day expiry. Include `credentials: 'include'` (or the equivalent in your HTTP client) on all subsequent requests to send this cookie automatically.
+</Note>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `400 Bad Request` | Validation failed, credentials are invalid, or the account was registered with a different auth provider (e.g. Google). |
+
+Error responses return a JSON array of human-readable strings:
+
+```json
+["Invalid credentials"]
+```
+
+If the email is registered but belongs to a Google account, the error will be:
+
+```json
+["Please sign in with Google"]
+```
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request POST \
+  --url https://your-apollo-instance.com/api/auth/signin \
+  --header 'Content-Type: application/json' \
+  --cookie-jar ./cookies.txt \
+  --data '{
+    "UserIdentifier": "ada@example.com",
+    "Password": "Secure!Pass1"
+  }'
+```
+
+```typescript TypeScript
+const response = await fetch('/api/auth/signin', {
+  method: 'POST',
+  credentials: 'include', // required so the cookie is stored
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    UserIdentifier: 'ada@example.com',
+    Password: 'Secure!Pass1',
+  }),
+});
+
+if (!response.ok) {
+  const errors: string[] = await response.json();
+  console.error(errors);
+} else {
+  const user = await response.json();
+  console.log(user.id, user.authProvider);
+}
+```
+
+</CodeGroup>

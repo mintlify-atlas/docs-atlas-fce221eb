@@ -1,0 +1,152 @@
+---
+title: "Environment variables"
+description: "Complete reference for every environment variable Apollo reads at startup, organized by functional group."
+keywords: ["environment variables", "configuration", "env", "dotenv", "secrets"]
+---
+
+Apollo is configured entirely through environment variables. There is no configuration UI and no runtime config file beyond `appsettings.json`, which only controls ASP.NET Core logging and the fallback connection string. Every secret — API keys, connection strings, JWT parameters — must be present as an environment variable before the process starts, or the application will throw and exit.
+
+In development, Apollo automatically loads a `.env` file from `Apollo.Api/` using [dotenv.net](https://github.com/bolorundurowb/dotenv.net). In production (when `ASPNETCORE_ENVIRONMENT` is not `Development`), the file is not loaded — you must inject variables through your deployment platform, Docker `--env-file`, or a secrets manager.
+
+<Warning>
+  Never commit your `.env` file to version control. Add `Apollo.Api/.env` to your `.gitignore`. The repository ships an `.env.example` with placeholder values — copy that file, fill in real values, and keep the result local only.
+</Warning>
+
+<Note>
+  **Minimum required variables to start Apollo:** `DATABASE_URL`, `VECTOR_DB_URL`, `JWT_SECRET_KEY`, `JWT_ISSUER`, `JWT_AUDIENCE`, `AZURE_AI_API_KEY`, `AZURE_AI_ENDPOINT`, `GOOGLE_AI_API_KEY`, `EXA_API_KEY`, `CLIENT_URL`, and `RESEND_API_KEY`. All of these are read at startup and will cause an immediate exception if missing.
+</Note>
+
+## Complete `.env` example
+
+```env Apollo.Api/.env
+# ── Database ──────────────────────────────────────────────────────────────
+DATABASE_URL=Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres
+VECTOR_DB_URL=Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres
+
+# ── JWT ───────────────────────────────────────────────────────────────────
+JWT_SECRET_KEY=replace-with-a-long-random-string-at-least-32-chars
+JWT_ISSUER=apollo
+JWT_AUDIENCE=apollo_api
+
+# ── Azure AI Foundry ──────────────────────────────────────────────────────
+AZURE_AI_API_KEY=your_azure_ai_api_key
+AZURE_AI_ENDPOINT=https://your-resource.openai.azure.com/
+
+# ── Google AI (Gemini) ────────────────────────────────────────────────────
+GOOGLE_AI_API_KEY=your_google_ai_api_key
+
+# ── Exa AI ────────────────────────────────────────────────────────────────
+EXA_API_KEY=your_exa_api_key
+
+# ── Application ───────────────────────────────────────────────────────────
+CLIENT_URL=http://localhost:3000
+RESEND_API_KEY=your_resend_api_key
+```
+
+---
+
+## Database
+
+Apollo uses two separate PostgreSQL connection strings — one for Entity Framework Core (relational data) and one for Kernel Memory (vector search). Both can point to the same PostgreSQL instance and database, but they are read independently so you can split them across different hosts if needed.
+
+<ParamField path="DATABASE_URL" type="string" required>
+  PostgreSQL connection string used by Entity Framework Core to connect to the main application database. Stores users, research sessions, plans, and reports.
+
+  **Format:** `Host=<host>;Port=<port>;Database=<db>;Username=<user>;Password=<pass>`
+
+  **Example:** `Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres`
+</ParamField>
+
+<ParamField path="VECTOR_DB_URL" type="string" required>
+  PostgreSQL connection string used by Kernel Memory for embedding storage and vector search via the pgvector extension. Can be the same value as `DATABASE_URL` for a single-instance setup.
+
+  **Format:** `Host=<host>;Port=<port>;Database=<db>;Username=<user>;Password=<pass>`
+
+  **Example:** `Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres`
+</ParamField>
+
+---
+
+## JWT
+
+Apollo issues JWT bearer tokens for authentication. The three JWT variables must be consistent: any token issued with a given set of values will fail validation if the server restarts with different values.
+
+<ParamField path="JWT_SECRET_KEY" type="string" required>
+  Symmetric signing key for HMAC-SHA256 JWT tokens. Must be at least 32 characters long. Changing this value invalidates all existing tokens and will log out all users.
+
+  **Example:** `a-very-long-random-secret-key-here-minimum-32-chars`
+</ParamField>
+
+<ParamField path="JWT_ISSUER" type="string" required>
+  The `iss` claim written into every token and validated on each request. Must match exactly between the issuing service and the validating service.
+
+  **Example:** `apollo`
+</ParamField>
+
+<ParamField path="JWT_AUDIENCE" type="string" required>
+  The `aud` claim written into every token. Identifies the intended recipient of the token.
+
+  **Example:** `apollo_api`
+</ParamField>
+
+---
+
+## Azure AI
+
+Apollo uses Azure AI Foundry (Azure OpenAI Service) for the three named agent chat completions and for Kernel Memory text generation and text embedding. Both the API key and the endpoint are required.
+
+See [Azure AI configuration](/configuration/azure-ai) for a full walkthrough of how to provision these resources.
+
+<ParamField path="AZURE_AI_API_KEY" type="string" required>
+  API key for your Azure AI Foundry project. Found in the Azure portal under your Azure OpenAI resource → **Keys and Endpoint**.
+
+  **Example:** `a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`
+</ParamField>
+
+<ParamField path="AZURE_AI_ENDPOINT" type="string" required>
+  The HTTPS endpoint URL for your Azure OpenAI resource. Includes a trailing slash.
+
+  **Example:** `https://my-apollo-resource.openai.azure.com/`
+</ParamField>
+
+---
+
+## Google AI
+
+Apollo uses Google's Gemini model (`gemini-2.5-flash-preview-04-17`) for the final large-context report synthesis step. The Gemini integration is defined in `ResearchReportGenerator` and can optionally replace or supplement the Azure OpenAI chat completion used in that stage.
+
+<ParamField path="GOOGLE_AI_API_KEY" type="string" required>
+  API key for Google AI Studio (Gemini). Obtain one at [aistudio.google.com](https://aistudio.google.com).
+
+  **Example:** `AIzaSyAbCdEfGhIjKlMnOpQrStUvWxYz`
+</ParamField>
+
+---
+
+## Exa AI
+
+Apollo uses Exa AI for all web search and content retrieval. The Research Engine agent (Athena) calls the Exa API to execute neural web searches and crawl page content during the active research phase.
+
+<ParamField path="EXA_API_KEY" type="string" required>
+  API key for the Exa AI search API. Obtain one at [exa.ai](https://exa.ai).
+
+  **Example:** `exa-1a2b3c4d5e6f7g8h9i0j`
+</ParamField>
+
+---
+
+## Application
+
+These variables control cross-cutting concerns like CORS and email delivery.
+
+<ParamField path="CLIENT_URL" type="string" required>
+  The base URL of the React frontend. Used to configure the ASP.NET Core CORS policy so the browser can make authenticated requests to the API. In development this is typically `http://localhost:3000`.
+
+  **Example:** `https://app.yourdomain.com`
+</ParamField>
+
+<ParamField path="RESEND_API_KEY" type="string" required>
+  API key for [Resend](https://resend.com), the transactional email service Apollo uses to send research completion notifications to users.
+
+  **Example:** `re_AbCdEfGhIjKlMnOpQrStUv`
+</ParamField>

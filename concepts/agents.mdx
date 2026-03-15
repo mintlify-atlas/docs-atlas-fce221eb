@@ -1,0 +1,240 @@
+---
+title: 'Agents'
+description: "How Apollo's three Semantic Kernel agents — Apollo (coordinator), Athena (engine), and Hermes (analyzer) — collaborate through AgentGroupChat with a shared state machine."
+---
+
+Apollo uses Semantic Kernel's `AgentGroupChat` to run three `ChatCompletionAgent` instances in a coordinated loop. Each agent has a distinct role, a dedicated set of kernel plugins, and its own system prompt. Rather than relying solely on the shared chat history for coordination, the agents communicate through a **state machine** (`StateManager`) that carries structured data outside the chat window—preventing context overflow and rate-limit pressure.
+
+## The three agents
+
+<AccordionGroup>
+  <Accordion title="Apollo — Research Coordinator">
+    **Agent ID:** `ResearchCoordinator`
+
+    The coordinator is the entry point for every chat turn. It checks the current `ResearchState`, decides what action to take next, and delegates to the appropriate specialist. It never performs research itself—its job is sequencing.
+
+    **Responsibilities:**
+    - Read state flags (`AnyPendingQuestionsRemaining`, `DoesResearchNeedAnalysis`, `HasInitialAnalysisBeenPerformed`) to determine the next step.
+    - Signal the analysis phase via `MarkAnalysisStarted`.
+    - Trigger final report synthesis via `SynthesizeFinalReportAsync` once the Table of Contents is approved.
+
+    **Plugins registered:**
+
+    | Plugin constant | Class | Purpose |
+    |---|---|---|
+    | `StatePlugin` | `StatePlugin` | Read/write research state flags and the TOC |
+    | `Research_Synthesis` | `SynthesizeResearchPlugin` | Invoke the report generator and mark research complete |
+
+    ```csharp AgentFactory.cs
+    public static ChatCompletionAgent CreateResearchCoordinator(
+        IKernelBuilder kernelBuilder,
+        IStateManager state,
+        IClientUpdateCallback streamingCallback,
+        string researchId,
+        SynthesizeResearchPlugin synthesizeResearchPluginInstance
+    )
+    {
+        var kernel = kernelBuilder.Build();
+
+        var statePluginInstance = new StatePlugin(
+            state,
+            kernel.LoggerFactory.CreateLogger<StatePlugin>(),
+            researchId
+        );
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(statePluginInstance, StatePluginName)
+        );
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(
+                synthesizeResearchPluginInstance, SynthesizeResearchPluginName
+            )
+        );
+
+        return new ChatCompletionAgent()
+        {
+            Kernel = kernel,
+            Id = ResearchCoordinatorAgentName,
+            Name = ResearchCoordinatorAgentName,
+            Instructions = Prompts.ResearchCoordinator,
+            Arguments = new KernelArguments(
+                new PromptExecutionSettings { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() }
+            ),
+        };
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Athena — Research Engine">
+    **Agent ID:** `ResearchEngine`
+
+    Athena is responsible for web research. When selected by the `ResearchSelectionStrategy`, it reads the active research question from state, generates 3–5 targeted SERP queries, calls Exa AI for each query, filters out already-crawled URLs, queues the results for asynchronous ingestion, and marks the question complete.
+
+    **Responsibilities:**
+    - Call `GetActiveResearchQuestion` to obtain the current question text.
+    - Generate diverse SERP queries and call `ProcessResearchQueries`.
+    - Write new `IngestEvent` objects to the `IIngestEventsQueue` channel.
+    - Call `MarkActiveQuestionComplete` when done.
+
+    **Plugins registered:**
+
+    | Plugin constant | Class | Purpose |
+    |---|---|---|
+    | `StatePlugin` | `StatePlugin` | Get the active question; mark it complete |
+    | `Research_Engine` | `ResearchEnginePlugin` | Execute web searches and queue ingestion |
+    | `TimePlugin` | `TimePlugin` (SK Core) | Provide current date/time for date-sensitive queries |
+
+    ```csharp AgentFactory.cs
+    public static ChatCompletionAgent CreateResearchEngine(
+        IKernelBuilder kernelBuilder,
+        IStateManager state,
+        IClientUpdateCallback streamingCallback,
+        string researchId,
+        ResearchEnginePlugin researchEnginePluginInstance
+    )
+    {
+        var kernel = kernelBuilder.Build();
+
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(new TimePlugin(), TimePluginName)
+        );
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(
+                new StatePlugin(state, kernel.LoggerFactory.CreateLogger<StatePlugin>(), researchId),
+                StatePluginName
+            )
+        );
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(
+                researchEnginePluginInstance, ResearchEnginePluginName
+            )
+        );
+
+        return new ChatCompletionAgent()
+        {
+            Kernel = kernel,
+            Id = ResearchEngineAgentName,
+            Name = ResearchEngineAgentName,
+            Instructions = Prompts.ResearchEngine,
+            Arguments = new KernelArguments(
+                new PromptExecutionSettings { FunctionChoiceBehavior = FunctionChoiceBehavior.Required() }
+            ),
+        };
+    }
+    ```
+
+    <Note>
+      Athena uses `FunctionChoiceBehavior.Required()` — the model is forced to call a plugin function on every turn, ensuring it always executes a search rather than producing a text-only response.
+    </Note>
+  </Accordion>
+
+  <Accordion title="Hermes — Research Analyzer">
+    **Agent ID:** `ResearchAnalyzer`
+
+    Hermes is activated after all initial research questions are processed. It performs **Self-Reflective RAG**: it queries the vector store about what has been learned, critiques its own knowledge gaps, adds new questions for any significant gaps it finds, and generates and refines the Table of Contents. This cycle repeats until no significant gaps remain.
+
+    **Responsibilities:**
+    - Call `AskMemoryAsync` with a self-reflective question to surface knowledge gaps.
+    - Call `AddGapAnalysisQuestions` for each significant gap (one question at a time to avoid rate limits).
+    - Build and update the Table of Contents via `UpdateTableOfContents`.
+    - Call `MarkAnalysisComplete` when done.
+
+    **Plugins registered:**
+
+    | Plugin constant | Class | Purpose |
+    |---|---|---|
+    | `StatePlugin` | `StatePlugin` | Read/update TOC; mark analysis complete; add gap questions |
+    | `Research_Memory` | `KernelMemoryPlugin` | Ask the vector store self-reflective questions |
+
+    ```csharp AgentFactory.cs
+    public static ChatCompletionAgent CreateResearchAnalyzer(
+        IKernelBuilder kernelBuilder,
+        IStateManager state,
+        IClientUpdateCallback streamingCallback,
+        string researchId,
+        KernelMemoryPlugin kernelMemoryPluginInstance
+    )
+    {
+        var kernel = kernelBuilder.Build();
+
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(
+                new StatePlugin(state, kernel.LoggerFactory.CreateLogger<StatePlugin>(), researchId),
+                StatePluginName
+            )
+        );
+        kernel.Plugins.Add(
+            KernelPluginFactory.CreateFromObject(
+                kernelMemoryPluginInstance, KernelMemoryPluginName
+            )
+        );
+
+        return new ChatCompletionAgent()
+        {
+            Kernel = kernel,
+            Id = ResearchAnalyzerAgentName,
+            Name = ResearchAnalyzerAgentName,
+            Instructions = Prompts.ResearchAnalyzer,
+            Arguments = new KernelArguments(
+                new PromptExecutionSettings { FunctionChoiceBehavior = FunctionChoiceBehavior.Required() }
+            ),
+        };
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Selection and termination strategies
+
+The `AgentGroupChat` does not pick agents at random. Two custom strategies—defined in `ResearchCoordination.cs`—wrap the `IResearchManager` interface to make all routing decisions based on live state.
+
+### ResearchSelectionStrategy
+
+`ResearchSelectionStrategy` extends Semantic Kernel's `SelectionStrategy` and delegates to `ResearchManager.SelectNextAgent`. The routing logic is:
+
+1. **Start:** Always route to `ResearchCoordinator` on the first turn.
+2. **After coordinator:** If `NeedsAnalysis` is set → route to `ResearchAnalyzer`. If there are pending questions → route to `ResearchEngine`. If a TOC exists and synthesis is pending → stay with `ResearchCoordinator`.
+3. **After engine:** Always return to `ResearchCoordinator`.
+4. **During analysis (`IsAnalyzing = true`):** Keep routing to `ResearchAnalyzer` until it clears the flag.
+5. **After analyzer:** Return to `ResearchCoordinator`.
+
+```csharp ResearchCoordination.cs
+public class ResearchSelectionStrategy : SelectionStrategy
+{
+    private readonly IResearchManager _researchManager;
+
+    protected override Task<Agent> SelectAgentAsync(
+        IReadOnlyList<Agent> agents,
+        IReadOnlyList<ChatMessageContent> history,
+        CancellationToken cancellationToken = default
+    )
+    {
+        Agent? nextAgent = _researchManager.SelectNextAgent(agents, history);
+        return Task.FromResult(nextAgent);
+    }
+}
+```
+
+### ResearchTerminationStrategy
+
+`ResearchTerminationStrategy` extends `TerminationStrategy` and calls `ResearchManager.CheckTermination`, which returns `true` only when `ResearchState.IsComplete` is `true`. That flag is set by `SynthesizeResearchPlugin` after the final report is saved.
+
+## State machine
+
+The `StateManager` (backed by `IMemoryCache` with a 1-hour sliding expiration) holds the full `ResearchState` for each active research session. It is the single source of truth shared across all three agents.
+
+Key fields in `ResearchState`:
+
+| Field | Type | Role |
+|---|---|---|
+| `PendingResearchQuestions` | `List<ResearchQuestion>` | Questions waiting to be researched by Athena |
+| `CompletedResearchQuestions` | `List<ResearchQuestion>` | Questions fully processed |
+| `AllQuestionsInOrder` | `List<ResearchQuestion>` | Full ordered list for the timeline UI |
+| `ActiveQuestionId` | `string?` | ID of the question Athena is currently working on |
+| `CrawledUrls` | `List<string>` | Deduplication set—prevents re-ingesting the same URL |
+| `TableOfContents` | `List<string>` | TOC sections proposed and refined by Hermes |
+| `NeedsAnalysis` | `bool` | Set when `PendingResearchQuestions` empties; triggers Hermes |
+| `IsAnalyzing` | `bool` | Set while Hermes is active |
+| `HasPerformedInitialAnalysis` | `bool` | Guards against re-triggering the first analysis pass |
+| `SynthesisComplete` / `IsComplete` | `bool` | Set when the final report is saved |
+
+Agents read and write state exclusively through `StatePlugin` kernel functions, keeping direct state mutations out of the chat history and within typed method calls.

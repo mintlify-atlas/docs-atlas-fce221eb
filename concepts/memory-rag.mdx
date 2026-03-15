@@ -1,0 +1,174 @@
+---
+title: 'Memory & RAG'
+description: 'How Apollo uses Kernel Memory with pgvector, Structured RAG, and Self-Reflective RAG to gather, critique, and synthesize research knowledge.'
+keywords: ['RAG', 'Kernel Memory', 'pgvector', 'Structured RAG', 'Self-Reflective RAG', 'embeddings', 'vector search']
+---
+
+Apollo's memory layer is built on [Kernel Memory](https://microsoft.github.io/kernel-memory/), a Microsoft library that handles the full pipeline from raw text ingestion to vector search and LLM-synthesized answers. Two advanced RAG techniques—**Structured RAG** and **Self-Reflective RAG**—sit on top of this foundation to make retrieval more precise and to surface knowledge gaps automatically.
+
+## Kernel Memory integration
+
+`MemoryContext` is Apollo's thin wrapper around a `MemoryServerless` instance. It is configured at startup and shared across the application as a singleton.
+
+```csharp MemoryContext.cs
+public MemoryContext()
+{
+    _memory = new KernelMemoryBuilder()
+        .WithSimpleVectorDb()          // swap for WithPostgresMemoryDb in production
+        .WithSimpleQueuesPipeline()
+        .With(new KernelMemoryConfig { DefaultIndexName = "apollo" })
+        .WithAzureOpenAITextEmbeddingGeneration(
+            new()
+            {
+                Auth = AzureOpenAIConfig.AuthTypes.APIKey,
+                APIKey = AppConfig.AzureAI.ApiKey,
+                APIType = AzureOpenAIConfig.APITypes.EmbeddingGeneration,
+                Deployment = AppConfig.Models.TextEmbeddingSmall,
+                Endpoint = AppConfig.AzureAI.Endpoint,
+                EmbeddingDimensions = 1536,
+            }
+        )
+        .WithAzureOpenAITextGeneration(
+            new()
+            {
+                Auth = AzureOpenAIConfig.AuthTypes.APIKey,
+                APIKey = AppConfig.AzureAI.ApiKey,
+                APIType = AzureOpenAIConfig.APITypes.TextCompletion,
+                Deployment = AppConfig.Models.Gpt41,
+                Endpoint = AppConfig.AzureAI.Endpoint,
+                MaxTokenTotal = 1047576,
+            }
+        )
+        .WithSearchClientConfig(new() { AnswerTokens = 16768, MaxAskPromptSize = 32768 })
+        .WithStructRagSearchClient()
+        .Build<MemoryServerless>(
+            new() { AllowMixingVolatileAndPersistentData = true }
+        );
+}
+```
+
+Each research session gets its own Kernel Memory **index** (named by `researchId`). This isolates vector data between concurrent research jobs and makes cleanup trivial—when a report is saved, `DeleteIndex` drops the entire index.
+
+### Chunking and embedding
+
+Content ingested via `MemoryContext.Ingest` passes through Kernel Memory's default text pipeline:
+
+1. **Text extraction** — the raw string is already pre-extracted by Exa AI's crawler.
+2. **Chunking** — the text is split into overlapping chunks. Kernel Memory handles chunk sizing automatically.
+3. **Embedding** — each chunk is embedded with Azure OpenAI `text-embedding-3-small` (1536 dimensions).
+4. **Storage** — embeddings and their text content are stored in the configured vector backend (pgvector in production, in-memory for development).
+
+Source metadata (URL, title, author, published date) is attached as `TagCollection` entries on each partition so that citations can be reconstructed at report-generation time.
+
+```csharp IngestEventHandler.cs
+var ingestionTasks = @event.SearchResults.Select(result =>
+{
+    var tags = new TagCollection
+    {
+        { "researchId", researchId },
+        { "url",        result.Url },
+        { "title",      result.Title },
+        { "author",     result.Author },
+        { "published",  result.PublishedDate },
+    };
+
+    return _memory.Ingest(researchId, result.Text, tags);
+});
+
+await Task.WhenAll(ingestionTasks);
+```
+
+All results in a single `IngestEvent` are embedded in parallel, so ingestion does not become the bottleneck even when Athena generates dozens of search results per question.
+
+## Structured RAG
+
+Apollo uses Kernel Memory's **Structured RAG search client** (`.WithStructRagSearchClient()`), configured via a reference implementation described in [Implementing Structured RAG Search Client in .NET](https://www.youtube.com/watch?v=O7Ce3YljyIY), which was itself inspired by the [Structured RAG paper (arXiv:2410.08815)](https://arxiv.org/abs/2410.08815).
+
+Standard RAG retrieves the top-K most similar chunks. Structured RAG goes further: it builds a structured table of retrieved chunks, re-ranks them by relevance, and conditions the LLM synthesis prompt on that ranked context. This is especially important for Apollo because:
+
+- Hermes needs **memory-wide context** to identify gaps—not just the chunks most similar to a single query vector.
+- The report generator needs **comprehensive section content** drawn from many distinct sources, not just the single most-similar chunk.
+
+With `AnswerTokens = 16768` and `MaxAskPromptSize = 32768`, Kernel Memory is configured to return substantial, well-sourced answers rather than short snippets.
+
+## Asynchronous ingestion queue
+
+Ingestion is deliberately decoupled from the agent chat loop. When `ResearchEnginePlugin` receives search results, it writes them to `IIngestEventsQueue` and immediately returns control to the agent. The `IngestProcessor` background service drains the queue independently.
+
+```csharp IngestProcessor.cs
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+{
+    await foreach (var ingestEvent in _queue.Reader.ReadAllAsync(stoppingToken))
+    {
+        using var scope = _serviceScopeFactory.CreateScope();
+        var handler = scope.ServiceProvider.GetRequiredService<IIngestEventHandler>();
+        handler.HandleIngestAsync(ingestEvent);
+    }
+}
+```
+
+This design means Athena can move on to the next SERP query while the previous batch of results is still being embedded. Kernel Memory is eventually consistent from the agent's perspective—by the time Hermes performs its analysis, all ingestion from the information-gathering phase is complete because the analysis phase only starts after all questions are marked processed.
+
+<Note>
+  `MemoryContext` uses a `ConcurrentDictionary<string, bool>` (`_activeIngestions`) to track whether ingestion is in progress for a given research ID. This flag is available via `IsIngestionInProgress` and can be checked before analysis begins to avoid querying a partially-populated index.
+</Note>
+
+## Self-Reflective RAG
+
+Self-Reflective RAG is the technique—inspired by [Langchain's Self-Reflective RAG tutorial](https://www.youtube.com/watch?v=pbAd8O1Lvm4)—where the system critiques its own knowledge base rather than querying an external source. Hermes uses it to determine whether the vector store contains sufficient information to write a comprehensive report.
+
+Instead of asking the vector store _"what do you know about X?"_, Hermes asks it a self-reflective question:
+
+> _"Based on all the research gathered so far about '[title]', what are the significant knowledge gaps? What important aspects are missing or insufficiently covered? Also propose a draft Table of Contents."_
+
+Kernel Memory synthesizes an answer by scanning the entire index. The answer is returned to Hermes as a lower-cased string. Hermes then decides:
+
+- If significant gaps are found → call `AddGapAnalysisQuestions` (once per gap) and let the coordinator route back to Athena.
+- If the knowledge base is sufficiently comprehensive → finalize the TOC and call `MarkAnalysisComplete`.
+
+```csharp KernelMemoryPlugin.cs
+[KernelFunction]
+[Description(
+    "Asks a question to the knowledge base (Kernel Memory) and gets a synthesized answer. "
+    + "Use this to get an internal critic of any significant knowledge gaps and a possible table of contents."
+)]
+public async Task<string> AskMemoryAsync(
+    [Description("The researchId")] string researchId,
+    [Description(
+        "The SINGLE self reflective question to ask the knowledge base to get "
+        + "knowledge gap analysis results and a draft toc."
+    )] string question,
+    CancellationToken cancellationToken = default
+)
+{
+    var response = await _memory.AskAsync(researchId, question, cancellationToken);
+    return response.Result.ToLower();
+}
+```
+
+<Note>
+  To prevent infinite research loops, Hermes is limited by its system prompt instructions to add only genuinely significant gaps. The `AddGapAnalysisQuestions` `StatePlugin` function accepts a single question per call (a deliberate design choice to reduce per-turn token usage). Additionally, `HasInitialAnalysisBeenPerformed` ensures the full analysis cycle only triggers once per run—subsequent coordinator evaluations do not re-enter the analysis phase unless `NeedsAnalysis` is explicitly set again by question completion.
+</Note>
+
+## Two-stage synthesis
+
+The final report is produced in two stages to balance depth, structure, and source attribution.
+
+**Stage 1: Per-section mini-reports.** `ResearchReportGenerator` iterates the approved Table of Contents in batches of 3. For each section, it calls `MemoryContext.AskAsync` with a structured prompt requesting facts, direct quotes, and citations. Kernel Memory's Structured RAG client synthesizes a focused answer for that section. Source metadata is extracted from partition tags on `MemoryAnswer.RelevantSources`.
+
+**Stage 2: Final LLM synthesis.** All mini-reports, the research overview, and the deduplicated source list are assembled into one Markdown document. This document is sent to a large-context GPT-4.1 model with `Prompts.ReportSynthesizerPrompt` and a `MaxTokens` limit of 32,768. The model stitches the sections into a coherent, fully-cited research report.
+
+This two-stage approach reflects the synthesis strategy described in Apollo's design notes: Kernel Memory handles section-specific retrieval and citation, while the large-context LLM handles narrative coherence and final formatting.
+
+<Tip>
+  The first stage distributes retrieval load across many focused queries, each returning dense, citation-rich notes. The second stage lets the LLM focus purely on writing quality without needing to perform any retrieval itself—a clean separation of concerns that also makes it straightforward to swap the synthesis model (e.g., to Gemini 2.5 Pro Flash) without changing the retrieval logic.
+</Tip>
+
+## Academic foundations
+
+| Technique | Reference | Apollo usage |
+|---|---|---|
+| Structured RAG | [arXiv:2410.08815](https://arxiv.org/abs/2410.08815) | Kernel Memory `WithStructRagSearchClient()` for memory-wide context retrieval |
+| Self-Reflective RAG | [Langchain tutorial](https://www.youtube.com/watch?v=pbAd8O1Lvm4) | Hermes critiques knowledge gaps by querying its own vector store |
+| GPT-4.1 prompting | [OpenAI cookbook](https://cookbook.openai.com/examples/gpt4-1_prompting_guide) | Agent system prompts and report synthesis instructions |
+| Deep research | [Jina AI guide](https://jina.ai/news/a-practical-guide-to-implementing-deepsearch-deepresearch/) | Overall multi-question, iterative research loop design |

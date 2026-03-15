@@ -1,0 +1,128 @@
+---
+title: "Create research"
+description: "Start a new research session. Apollo immediately persists the request and begins agent orchestration in the background."
+---
+
+<Badge color="blue">POST</Badge> `/api/research`
+
+Creates a new research item for the authenticated user, stores it in the database with a status of `InProgress`, and fires a `ResearchStartEvent` that triggers the Semantic Kernel agent pipeline asynchronously. The response is returned before the agents finish — use the [SignalR research hub](/api-reference/signalr/research-hub) to receive live progress events, or poll [Get research](/api-reference/research/get) to check the final status.
+
+## Authentication
+
+Required. The request must include the `apollo_access_token` HTTP-only cookie.
+
+<Note>
+  Browsers send this cookie automatically when `credentials: 'include'` is set on the fetch call.
+</Note>
+
+---
+
+## Request body
+
+<ParamField body="Title" type="string" required>
+  A short label for the research session. Displayed in history and reports.
+</ParamField>
+
+<ParamField body="Description" type="string" required>
+  A longer description of the research objective or context.
+</ParamField>
+
+<ParamField body="Questions" type="string[]" required>
+  One or more specific questions the agent pipeline should investigate. Each string is a distinct research question.
+</ParamField>
+
+<ParamField body="Type" type="string" required>
+  The category or type of research being performed (e.g. `"market"`, `"technical"`, `"academic"`).
+</ParamField>
+
+<ParamField body="Depth" type="string" required>
+  The desired depth of analysis (e.g. `"shallow"`, `"standard"`, `"deep"`).
+</ParamField>
+
+---
+
+## Response
+
+Returns a `CreateResearchResponse` object on success (`200 OK`).
+
+<ResponseField name="id" type="string" required>
+  UUID that uniquely identifies the new research session. Use this value as `researchId` when calling other endpoints or when joining the SignalR group.
+</ResponseField>
+
+<ResponseField name="title" type="string" required>
+  The title supplied in the request body.
+</ResponseField>
+
+<ResponseField name="description" type="string" required>
+  The description supplied in the request body.
+</ResponseField>
+
+<ResponseField name="startedAt" type="string" required>
+  ISO 8601 UTC timestamp of when the research record was created.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Initial status of the research session. Always `"InProgress"` immediately after creation.
+</ResponseField>
+
+<Note>
+  The research is processed entirely in the background. Connect to the [SignalR research hub](/api-reference/signalr/research-hub) and call `JoinResearchStream` with the returned `id` to start receiving live timeline, feed, and agent chat events.
+</Note>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `401 Unauthorized` | No valid session cookie was sent, or the session has expired. |
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request POST \
+  --url https://your-apollo-instance.com/api/research \
+  --header 'Content-Type: application/json' \
+  --cookie 'apollo_access_token=<your-token>' \
+  --data '{
+    "Title": "The future of renewable energy",
+    "Description": "An in-depth look at solar and wind adoption trends over the next decade.",
+    "Questions": [
+      "What are the fastest-growing renewable energy sectors?",
+      "What policy changes are accelerating adoption?"
+    ],
+    "Type": "market",
+    "Depth": "deep"
+  }'
+```
+
+```typescript TypeScript
+const response = await fetch('/api/research', {
+  method: 'POST',
+  credentials: 'include',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    Title: 'The future of renewable energy',
+    Description: 'An in-depth look at solar and wind adoption trends over the next decade.',
+    Questions: [
+      'What are the fastest-growing renewable energy sectors?',
+      'What policy changes are accelerating adoption?',
+    ],
+    Type: 'market',
+    Depth: 'deep',
+  }),
+});
+
+if (!response.ok) {
+  throw new Error(`Unexpected status ${response.status}`);
+}
+
+const research = await response.json();
+console.log(research.id, research.status); // e.g. "3fa85f64-..." "InProgress"
+```
+
+</CodeGroup>

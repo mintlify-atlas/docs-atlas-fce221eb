@@ -1,0 +1,376 @@
+---
+title: "Research hub (SignalR)"
+description: "Real-time WebSocket hub for live research progress events. Subscribe to timeline updates, feed events, and agent chat messages as the Apollo agent pipeline runs."
+---
+
+**Hub URL:** `/hubs/research`
+
+The research hub is a [SignalR](https://learn.microsoft.com/en-us/aspnet/core/signalr/introduction) hub that pushes live events to connected clients while a research session is running. It uses WebSockets (with automatic fallback to Server-Sent Events or long polling) and the same cookie-based authentication as the REST API.
+
+## Authentication
+
+Required. The SignalR connection must be established with credentials so the server can identify the user. Pass `withCredentials: true` when building the connection — the browser will include the `apollo_access_token` cookie automatically.
+
+<Warning>
+  The hub connection will be dropped and no events will be delivered if the session cookie is missing or expired.
+</Warning>
+
+---
+
+## Connecting
+
+Install the SignalR client package:
+
+```bash
+npm install @microsoft/signalr
+```
+
+Then build and start a connection:
+
+```typescript
+import * as signalR from '@microsoft/signalr';
+
+const connection = new signalR.HubConnectionBuilder()
+  .withUrl('/hubs/research', { withCredentials: true })
+  .withAutomaticReconnect()
+  .build();
+
+await connection.start();
+console.log('Connected to research hub');
+```
+
+---
+
+## Group-based subscriptions
+
+Events are scoped to individual research sessions using SignalR groups. After connecting, call `JoinResearchStream` with the research session ID to start receiving events for that session. Call `LeaveResearchStream` when done.
+
+```typescript
+// Start receiving events for a specific research session
+await connection.invoke('JoinResearchStream', researchId);
+
+// Stop receiving events (e.g. when navigating away)
+await connection.invoke('LeaveResearchStream', researchId);
+```
+
+<Note>
+  If you reconnect after a drop, call [Get research updates](/api-reference/research/updates) first to replay any events missed during the disconnection, then re-invoke `JoinResearchStream`.
+</Note>
+
+---
+
+## Hub methods (client → server)
+
+These are methods your client can invoke on the hub.
+
+| Method | Parameters | Description |
+|--------|------------|-------------|
+| `JoinResearchStream` | `researchId: string` | Add the connection to the group for the given research session. Required before events are delivered. |
+| `LeaveResearchStream` | `researchId: string` | Remove the connection from the research session group. |
+| `StartResearchChat` | `sessionId: string`, `initialQuery: string` | Start an interactive planning chat session. |
+| `ReceiveMessage` | `message: string` | Send a follow-up message to a running chat session. |
+
+---
+
+## Server events (server → client)
+
+The server pushes the following events to connected clients. Register handlers before calling `JoinResearchStream`.
+
+<AccordionGroup>
+
+  <Accordion title="ResearchSaved">
+    Emitted when the research session record has been persisted to the database and is ready to be tracked. Sent directly to the owning user (not to the group).
+
+    ```typescript
+    connection.on('ResearchSaved', (researchId: string) => {
+      console.log('Research saved:', researchId);
+    });
+    ```
+
+    **Payload**
+
+    <ResponseField name="researchId" type="string" required>
+      UUID of the research session that was saved.
+    </ResponseField>
+  </Accordion>
+
+  <Accordion title="ResearchCompleted">
+    Emitted when the agent pipeline finishes and the research session status is set to `Complete`. Sent directly to the owning user.
+
+    ```typescript
+    connection.on('ResearchCompleted', (researchId: string) => {
+      console.log('Research complete:', researchId);
+    });
+    ```
+
+    **Payload**
+
+    <ResponseField name="researchId" type="string" required>
+      UUID of the completed research session.
+    </ResponseField>
+  </Accordion>
+
+  <Accordion title="ResearchCompletedWithReport">
+    Emitted alongside `ResearchCompleted` when a report has been generated. Contains the report content so the client can display it without an additional HTTP request. Sent directly to the owning user.
+
+    ```typescript
+    connection.on(
+      'ResearchCompletedWithReport',
+      (researchId: string, report: { id: string; content: string }) => {
+        console.log('Report ready:', report.id);
+        renderMarkdown(report.content);
+      }
+    );
+    ```
+
+    **Payload**
+
+    <ResponseField name="researchId" type="string" required>
+      UUID of the completed research session.
+    </ResponseField>
+
+    <ResponseField name="report" type="object" required>
+      The generated report object.
+      <Expandable title="report properties">
+        <ResponseField name="id" type="string" required>
+          UUID of the report record.
+        </ResponseField>
+        <ResponseField name="content" type="string" required>
+          Full Markdown content of the generated report.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Accordion>
+
+  <Accordion title="ReceiveTimelineUpdate">
+    Emitted when the agent pipeline advances to a new stage. Delivers the full current state of the research timeline so the client can replace its local copy.
+
+    ```typescript
+    connection.on('ReceiveTimelineUpdate', (update: TimelineUpdateEvent) => {
+      setTimeline(update.items);
+    });
+    ```
+
+    **Payload — `TimelineUpdateEvent`**
+
+    <ResponseField name="researchId" type="string" required>
+      UUID of the research session this event belongs to.
+    </ResponseField>
+
+    <ResponseField name="timestamp" type="string" required>
+      ISO 8601 UTC timestamp of when the event was emitted.
+    </ResponseField>
+
+    <ResponseField name="items" type="object[]" required>
+      Full list of timeline items reflecting the current pipeline state.
+      <Expandable title="TimelineItem properties">
+        <ResponseField name="id" type="string" required>
+          Unique identifier for this timeline item.
+        </ResponseField>
+        <ResponseField name="text" type="string" required>
+          Human-readable label for the timeline step.
+        </ResponseField>
+        <ResponseField name="type" type="string" required>
+          The kind of step. One of `"Question"`, `"Analysis"`, or `"Synthesis"`.
+        </ResponseField>
+        <ResponseField name="active" type="boolean" required>
+          `true` when this step is the one currently being executed.
+        </ResponseField>
+        <ResponseField name="status" type="string" required>
+          Execution state of this step. One of `"Pending"`, `"InProgress"`, or `"Completed"`.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Accordion>
+
+  <Accordion title="ReceiveResearchFeedUpdate">
+    Emitted as the agent produces intermediate results. The event is polymorphic — the `type` field determines the concrete subtype and the additional fields present.
+
+    ```typescript
+    connection.on('ReceiveResearchFeedUpdate', (update: ResearchFeedUpdateEvent) => {
+      switch (update.type) {
+        case 'Message':        handleProgressMessage(update); break;
+        case 'Searching':      handleWebSearch(update);       break;
+        case 'SearchResults':  handleSearchResults(update);   break;
+        case 'Snippet':        handleSnippet(update);         break;
+        case 'TableOfContents': handleTableOfContents(update); break;
+      }
+    });
+    ```
+
+    **Common fields (all subtypes)**
+
+    <ResponseField name="researchId" type="string" required>
+      UUID of the research session this event belongs to.
+    </ResponseField>
+
+    <ResponseField name="timestamp" type="string" required>
+      ISO 8601 UTC timestamp of when the event was emitted.
+    </ResponseField>
+
+    <ResponseField name="type" type="string" required>
+      Discriminator for the event subtype. One of `"Message"`, `"Searching"`, `"SearchResults"`, `"Snippet"`, or `"TableOfContents"`.
+    </ResponseField>
+
+    **Subtype: `ProgressMessageFeedUpdate` (`type: "Message"`)**
+
+    <ResponseField name="message" type="string" required>
+      A human-readable progress message describing what the agent is currently doing.
+    </ResponseField>
+
+    **Subtype: `WebSearchFeedUpdate` (`type: "Searching"`)**
+
+    <ResponseField name="query" type="string" required>
+      The web search query string the agent submitted.
+    </ResponseField>
+
+    **Subtype: `SearchResultsFeedUpdate` (`type: "SearchResults"`)**
+
+    <ResponseField name="results" type="object[]" required>
+      List of search result items returned for the query.
+      <Expandable title="SearchResultItemContract properties">
+        <ResponseField name="id" type="string" required>
+          Unique identifier for this search result.
+        </ResponseField>
+        <ResponseField name="icon" type="string" required>
+          URL or identifier for the source site's favicon or icon.
+        </ResponseField>
+        <ResponseField name="title" type="string" required>
+          Title of the search result page.
+        </ResponseField>
+        <ResponseField name="url" type="string" required>
+          Full URL of the search result.
+        </ResponseField>
+        <ResponseField name="snippet" type="string">
+          Short excerpt from the result page. May be `null`.
+        </ResponseField>
+        <ResponseField name="highlights" type="string[]">
+          Key phrases highlighted in the result. May be `null`.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+
+    **Subtype: `SnippetFeedUpdate` (`type: "Snippet"`)**
+
+    <ResponseField name="content" type="string" required>
+      The extracted text snippet from a source document.
+    </ResponseField>
+
+    <ResponseField name="highlights" type="string[]">
+      Key phrases highlighted within the snippet. May be `null`.
+    </ResponseField>
+
+    **Subtype: `TableOfContentsFeedUpdate` (`type: "TableOfContents"`)**
+
+    <ResponseField name="sections" type="string[]" required>
+      Ordered list of section headings for the report being generated.
+    </ResponseField>
+  </Accordion>
+
+  <Accordion title="ReceiveAgentChatMessage">
+    Emitted when an agent in the pipeline produces a conversational message. Use this to display a live "thinking" or narration feed alongside the research progress.
+
+    ```typescript
+    connection.on('ReceiveAgentChatMessage', (message: AgentChatMessageEvent) => {
+      appendChatMessage({
+        author: message.author,
+        text: message.message,
+        at: message.timestamp,
+      });
+    });
+    ```
+
+    **Payload — `AgentChatMessageEvent`**
+
+    <ResponseField name="researchId" type="string" required>
+      UUID of the research session this message belongs to.
+    </ResponseField>
+
+    <ResponseField name="timestamp" type="string" required>
+      ISO 8601 UTC timestamp of when the message was emitted.
+    </ResponseField>
+
+    <ResponseField name="author" type="string" required>
+      Identifier of the agent or pipeline component that produced the message (e.g. `"Planner"`, `"Researcher"`).
+    </ResponseField>
+
+    <ResponseField name="message" type="string" required>
+      The text content of the agent message.
+    </ResponseField>
+  </Accordion>
+
+  <Accordion title="ReceiveResponse">
+    Emitted during an interactive planning chat session (started via `StartResearchChat`). Streams the planner agent's response text back to the specific connection that initiated the chat.
+
+    ```typescript
+    connection.on('ReceiveResponse', (chunk: string) => {
+      appendToCurrentMessage(chunk);
+    });
+    ```
+
+    **Payload**
+
+    <ResponseField name="response" type="string" required>
+      A text chunk from the planner agent's response stream.
+    </ResponseField>
+  </Accordion>
+
+</AccordionGroup>
+
+---
+
+## Full connection example
+
+```typescript
+import * as signalR from '@microsoft/signalr';
+
+async function connectToResearchHub(researchId: string) {
+  const connection = new signalR.HubConnectionBuilder()
+    .withUrl('/hubs/research', { withCredentials: true })
+    .withAutomaticReconnect()
+    .build();
+
+  // Register event handlers before connecting
+  connection.on('ResearchSaved', (id: string) => {
+    console.log('Saved:', id);
+  });
+
+  connection.on('ResearchCompletedWithReport', (id: string, report: { id: string; content: string }) => {
+    console.log('Complete. Report ID:', report.id);
+    renderMarkdown(report.content);
+  });
+
+  connection.on('ReceiveTimelineUpdate', (update) => {
+    setTimeline(update.items);
+  });
+
+  connection.on('ReceiveResearchFeedUpdate', (update) => {
+    appendFeedItem(update);
+  });
+
+  connection.on('ReceiveAgentChatMessage', (msg) => {
+    appendChatMessage(msg);
+  });
+
+  // Start the connection
+  await connection.start();
+
+  // Replay any missed events before joining live stream
+  const catchUp = await fetch(`/api/research/${researchId}/updates`, {
+    credentials: 'include',
+  });
+  const { feedUpdates, chatMessages } = await catchUp.json();
+  feedUpdates.forEach(applyFeedUpdate);
+  chatMessages.forEach(appendChatMessage);
+
+  // Join the live stream for this research session
+  await connection.invoke('JoinResearchStream', researchId);
+
+  return connection;
+}
+
+async function disconnect(connection: signalR.HubConnection, researchId: string) {
+  await connection.invoke('LeaveResearchStream', researchId);
+  await connection.stop();
+}
+```

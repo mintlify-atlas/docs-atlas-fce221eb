@@ -1,0 +1,212 @@
+---
+title: "Deployment"
+description: "Deploy the Apollo backend and frontend to production using Docker, Render.com, Azure App Service, Vercel, or Netlify."
+keywords: ["deployment", "docker", "render", "azure", "vercel", "netlify", "production"]
+---
+
+Apollo's backend is a Dockerized .NET 9 application that can be deployed to any platform that runs containers. The frontend is a Vite-built React SPA that can be served from any static hosting provider.
+
+<Warning>
+  In production you must restrict the backend CORS policy to the exact origin of your deployed frontend. The backend's CORS policy is named `apollo` and is configured in `Program.cs`. It reads the allowed origin from `AppConfig.Client.Url`, which is populated from your environment variables. Leaving it open to all origins exposes your API to cross-site requests from untrusted pages.
+</Warning>
+
+<Tabs>
+  <Tab title="Docker">
+    The repository includes a multi-stage `Dockerfile` that produces a minimal ASP.NET Core 9 runtime image.
+
+    **Build the image:**
+
+    ```bash Build the Docker image
+    docker build -t apollo-api .
+    ```
+
+    **Run the container locally:**
+
+    ```bash Run the container
+    docker run -p 8080:80 \
+      -e DATABASE_URL="Host=host.docker.internal;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres" \
+      -e VECTOR_DB_URL="Host=host.docker.internal;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres" \
+      -e JWT_SECRET_KEY="your_secret_key" \
+      -e JWT_ISSUER="apollo" \
+      -e JWT_AUDIENCE="apollo_api" \
+      -e AZURE_AI_API_KEY="your_azure_ai_api_key" \
+      -e AZURE_AI_ENDPOINT="https://your-resource.openai.azure.com/" \
+      -e GOOGLE_AI_API_KEY="your_google_ai_api_key" \
+      -e EXA_API_KEY="your_exa_api_key" \
+      -e CLIENT_URL="https://your-frontend-domain.com" \
+      apollo-api
+    ```
+
+    The Dockerfile sets `ASPNETCORE_URLS=http://+:80` and `ASPNETCORE_ENVIRONMENT=Production`, so the API listens on port 80 inside the container. The `docker run` command above maps container port 80 to host port 8080.
+
+    **Environment variables reference:**
+
+    | Variable | Description |
+    |---|---|
+    | `DATABASE_URL` | PostgreSQL connection string for EF Core |
+    | `VECTOR_DB_URL` | PostgreSQL connection string for Kernel Memory (pgvector) |
+    | `JWT_SECRET_KEY` | Secret used to sign JWT tokens |
+    | `JWT_ISSUER` | JWT issuer claim (default: `apollo`) |
+    | `JWT_AUDIENCE` | JWT audience claim (default: `apollo_api`) |
+    | `AZURE_AI_API_KEY` | Azure AI Foundry API key |
+    | `AZURE_AI_ENDPOINT` | Azure AI Foundry endpoint URL |
+    | `GOOGLE_AI_API_KEY` | Google AI API key for Gemini synthesis |
+    | `EXA_API_KEY` | Exa AI API key for web search |
+    | `CLIENT_URL` | Frontend origin, used by the CORS policy |
+  </Tab>
+
+  <Tab title="Render.com">
+    Render.com can build and run the Docker image directly from your GitHub repository.
+
+    <Steps>
+      <Step title="Push your repository to GitHub">
+        Make sure your code is pushed to a GitHub (or GitLab) repository that Render can access.
+      </Step>
+
+      <Step title="Create a new Web Service">
+        1. Log in to [Render](https://render.com) and click **New → Web Service**.
+        2. Connect your repository.
+        3. Set the **Runtime** to **Docker**. Render will automatically detect the `Dockerfile` in the repository root.
+      </Step>
+
+      <Step title="Configure environment variables">
+        In the **Environment** section of the Render service settings, add each variable from the table in the Docker tab above.
+
+        Render exposes a `PORT` environment variable automatically. The `Dockerfile` already sets `ASPNETCORE_URLS=http://+:80`, so no additional port configuration is required — Render maps its internal port to container port 80.
+      </Step>
+
+      <Step title="Set the health check path">
+        Set the **Health Check Path** to `/` or any lightweight endpoint (e.g., `/scalar/v1` is only available in development, so use a dedicated health endpoint if you have one). This allows Render to confirm the service is up after deployment.
+      </Step>
+
+      <Step title="Deploy">
+        Click **Create Web Service**. Render will pull the repository, build the Docker image, and start the container. Once the deploy is marked healthy, your API is live at the Render-provided URL (e.g., `https://apollo-api.onrender.com`).
+
+        Copy that URL and use it as the `VITE_SERVER_URL` when deploying the frontend.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Azure App Service">
+    Azure App Service can run Docker containers directly via its **Web App for Containers** offering.
+
+    <Steps>
+      <Step title="Push the image to a container registry">
+        Push the built Docker image to Azure Container Registry (ACR) or Docker Hub:
+
+        ```bash Push to Azure Container Registry
+        az acr build --registry <your-registry-name> --image apollo-api:latest .
+        ```
+      </Step>
+
+      <Step title="Create an App Service plan and Web App">
+        ```bash Create App Service resources
+        az group create --name apollo-rg --location eastus
+
+        az appservice plan create \
+          --name apollo-plan \
+          --resource-group apollo-rg \
+          --is-linux \
+          --sku B2
+
+        az webapp create \
+          --resource-group apollo-rg \
+          --plan apollo-plan \
+          --name apollo-api \
+          --deployment-container-image-name <your-registry-name>.azurecr.io/apollo-api:latest
+        ```
+      </Step>
+
+      <Step title="Configure environment variables">
+        Set the required application settings via the Azure CLI or the Azure Portal under **Settings → Environment variables**:
+
+        ```bash Set app settings
+        az webapp config appsettings set \
+          --resource-group apollo-rg \
+          --name apollo-api \
+          --settings \
+            DATABASE_URL="<connection-string>" \
+            VECTOR_DB_URL="<connection-string>" \
+            JWT_SECRET_KEY="<secret>" \
+            JWT_ISSUER="apollo" \
+            JWT_AUDIENCE="apollo_api" \
+            AZURE_AI_API_KEY="<key>" \
+            AZURE_AI_ENDPOINT="<endpoint>" \
+            GOOGLE_AI_API_KEY="<key>" \
+            EXA_API_KEY="<key>" \
+            CLIENT_URL="https://your-frontend-domain.com"
+        ```
+      </Step>
+
+      <Step title="Enable continuous deployment (optional)">
+        In the Azure Portal under **Deployment Center**, connect to your container registry to enable automatic redeploys whenever a new image is pushed.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Frontend (Vercel / Netlify)">
+    The Apollo frontend is a standard Vite SPA. Build it and deploy the output to any static host.
+
+    **Build the production bundle:**
+
+    <CodeGroup>
+
+    ```bash Bun
+    cd Apollo.Client
+    bun run build
+    ```
+
+    ```bash npm
+    cd Apollo.Client
+    npm run build
+    ```
+
+    </CodeGroup>
+
+    The build output is written to `Apollo.Client/dist/`.
+
+    **Environment variable:**
+
+    The frontend reads the backend URL from `VITE_SERVER_URL` at build time (see `Apollo.Client/config.ts`). Set this in your hosting provider's environment variable settings before triggering a build:
+
+    ```bash Apollo.Client/.env.production
+    VITE_SERVER_URL=https://your-deployed-api-url.com
+    VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id
+    ```
+
+    **SPA routing rewrite:**
+
+    Both Vercel and Netlify need a rewrite rule so that deep-linked URLs are served by `index.html` rather than returning a 404. The repository already includes a `vercel.json` with the correct rule:
+
+    ```json vercel.json
+    {
+      "routes": [{ "src": "/[^.]+", "dest": "/", "status": 200 }]
+    }
+    ```
+
+    For Netlify, add a `_redirects` file to the `public/` directory:
+
+    ```text public/_redirects
+    /*    /index.html    200
+    ```
+
+    **Deploying to Vercel:**
+
+    1. Import the repository in the [Vercel dashboard](https://vercel.com/new).
+    2. Set the **Root Directory** to `Apollo.Client`.
+    3. Set the **Build Command** to `bun run build` and the **Output Directory** to `dist`.
+    4. Add `VITE_SERVER_URL` and `VITE_GOOGLE_CLIENT_ID` under **Environment Variables**.
+    5. Deploy.
+
+    **Deploying to Netlify:**
+
+    1. Connect the repository in the Netlify dashboard.
+    2. Set the **Base directory** to `Apollo.Client`, **Build command** to `bun run build`, and **Publish directory** to `Apollo.Client/dist`.
+    3. Add the environment variables under **Site configuration → Environment variables**.
+    4. Deploy.
+
+    <Note>
+      After deploying the frontend, update the `CLIENT_URL` environment variable on your backend deployment to match the exact origin of your Vercel or Netlify URL (e.g., `https://apollo.vercel.app`). Then redeploy the backend so the CORS policy picks up the new value.
+    </Note>
+  </Tab>
+</Tabs>

@@ -1,0 +1,86 @@
+---
+title: 'Architecture'
+description: 'A high-level overview of Apollo\'s system design: a .NET 9 backend, React frontend, PostgreSQL with pgvector, and an event-driven multi-agent pipeline.'
+keywords: ['architecture', 'system design', '.NET', 'SignalR', 'event-driven', 'modules']
+---
+
+Apollo is built around three main principles: **modularity**, **event-driven concurrency**, and **real-time transparency**. The backend is a .NET 9 ASP.NET Core Web API that orchestrates a team of AI agents. A React frontend connects to it over SignalR to stream live research progress to the user. PostgreSQL with the pgvector extension acts as the persistent store for both relational data and vector embeddings.
+
+<CardGroup cols={2}>
+  <Card title="Agent orchestration" icon="robot">
+    Semantic Kernel's `AgentGroupChat` coordinates three specialized agents—Apollo, Athena, and Hermes—through a shared chat history and a custom state machine.
+  </Card>
+  <Card title="Event-driven pipeline" icon="bolt">
+    .NET `Channel<T>` primitives form two internal event buses: one for research lifecycle events and one for asynchronous web-content ingestion.
+  </Card>
+  <Card title="Vector memory" icon="database">
+    Kernel Memory chunks, embeds, and stores ingested web content in PostgreSQL (pgvector). A Structured RAG search client provides memory-wide retrieval for agent queries.
+  </Card>
+  <Card title="Real-time UI" icon="broadcast">
+    SignalR pushes progress messages, search results, timeline updates, and agent chat messages to the React client as they happen—no polling required.
+  </Card>
+</CardGroup>
+
+## Project modules
+
+Apollo is organized as a multi-project .NET solution. Each project has a single, well-defined responsibility.
+
+| Project | Responsibility |
+|---|---|
+| `Apollo.Api` | ASP.NET Core Web API — HTTP endpoints, SignalR hubs, DI wiring, background service registration |
+| `Apollo.Agents` | All AI agent logic — orchestration, plugins, state management, memory, event queues |
+| `Apollo.Data` | Entity Framework Core models, `ApolloDbContext`, database migrations, repository access |
+| `Apollo.Client` | React (Vite) frontend — TanStack Router & Query, SignalR client, UI components |
+| `Apollo.Config` | Centralized configuration — API keys, model deployment names, database connection strings |
+| `Apollo.Search` | Exa AI search integration — `ISearchService`, `WebSearchRequest`/`WebSearchResponse` models |
+| `Apollo.Notifications` | Email notifications — `IEmailService`, research-complete email templates |
+
+## Event-driven design
+
+Apollo avoids blocking the HTTP request thread by routing long-running work through .NET channels. There are two independent event buses.
+
+### Research events bus
+
+When a user saves a research plan, `ResearchEventHandler.HandleResearchStart` writes a `ResearchStartEvent` to the `ResearchEventsQueue` channel. The `ResearchProcessor` background service (`BackgroundService`) continuously reads from that channel and spawns a scoped `ResearchOrchestrator` for each event.
+
+```csharp ResearchEventsQueue.cs
+public class ResearchEventsQueue : IResearchEventsQueue
+{
+    private readonly Channel<ResearchStartEvent> _channel;
+
+    public ResearchEventsQueue()
+    {
+        _channel = Channel.CreateUnbounded<ResearchStartEvent>(
+            new UnboundedChannelOptions { SingleReader = true }
+        );
+    }
+
+    public ChannelReader<ResearchStartEvent> Reader => _channel.Reader;
+    public ChannelWriter<ResearchStartEvent> Writer => _channel.Writer;
+}
+```
+
+### Ingest events bus
+
+While agents are running, Athena writes batches of `WebSearchResult` objects to the `IngestEventsQueue`. The `IngestProcessor` background service drains that queue and calls `IngestEventHandler.HandleIngestAsync`, which parallelizes the Kernel Memory ingestion calls so that web crawling never blocks the agent chat loop.
+
+## SignalR real-time updates
+
+The `IClientUpdateCallback` abstraction (injected into orchestrators, plugins, and the state manager) wraps the SignalR hub. Every component that needs to push a message to the browser calls one of its methods:
+
+| Method | Payload type | When emitted |
+|---|---|---|
+| `StreamPlannerResponse` | `string` chunk | Streaming tokens from the planning chat |
+| `SendResearchFeedUpdate` | `ResearchFeedUpdateEvent` | Progress messages, search queries, search results, snippets, TOC |
+| `SendAgentChatMessage` | `AgentChatMessageEvent` | Each agent's streamed chat turn |
+| `SendTimelineUpdate` | `TimelineUpdateEvent` | Question status changes (Pending → InProgress → Completed) |
+
+The React client connects to the SignalR hub on page load and subscribes to all four event types, rendering them in real time without any manual polling.
+
+## Deployment
+
+The backend ships as a Dockerfile for deployment to platforms such as Render.com or Azure App Service. The React frontend is built as a static bundle (`bun run build`) and hosted separately on Vercel or Netlify, with the `VITE_API_URL` environment variable pointing to the deployed API.
+
+<Note>
+  Apollo's CORS policy must explicitly allow the deployed client origin. Set the allowed origins in `Apollo.Api` before deploying to production.
+</Note>

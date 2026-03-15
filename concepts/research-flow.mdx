@@ -1,0 +1,241 @@
+---
+title: 'Research flow'
+description: 'A step-by-step walkthrough of the complete Apollo research lifecycle, from query submission to the final synthesized report.'
+keywords: ['research flow', 'orchestration', 'planning', 'ingestion', 'synthesis', 'ResearchOrchestrator']
+---
+
+Every Apollo research run passes through five distinct phases. Each phase is implemented by a specific component and produces a well-defined artifact that the next phase consumes.
+
+<Steps>
+  <Step title="Initial query & planning">
+    The user submits a research query through the React client. The query arrives at the API and is passed to `ResearchPlanner`, which opens a streaming chat session with GPT-4.1 using `IChatCompletionService`.
+
+    The planner's system prompt (`Prompts.ResearchPlanner`) instructs the model to:
+    - Clarify the research intent with the user if the query is ambiguous.
+    - Produce a structured research itinerary: a title, a description, and a list of core research questions.
+
+    When the user confirms the plan, the `StartResearchPlugin` (registered on the planner's kernel) saves the plan to the database as a `Research` entity with a `ResearchPlan` containing the question list.
+
+    Saving the record triggers `ResearchEventHandler.HandleResearchStart`, which does two things in parallel:
+    1. Notifies the connected React client via SignalR that the research has been saved.
+    2. Writes a `ResearchStartEvent` to `IResearchEventsQueue`.
+
+    ```csharp ResearchPlanner.cs
+    public async Task StartChatSession(
+        string sessionId,
+        string initialQuery,
+        string connectionId,
+        string userId
+    )
+    {
+        var chatState = new ChatState
+        {
+            SessionId = sessionId,
+            ConnectionId = connectionId,
+            UserId = userId,
+            ChatHistory =
+            [
+                new ChatMessageContent(AuthorRole.System, Prompts.ResearchPlanner(userId)),
+                new ChatMessageContent(AuthorRole.User, initialQuery),
+            ],
+        };
+
+        _cache.Set(connectionId, chatState, _cacheTimeout);
+        await StreamResponse(connectionId, chatState.ChatHistory);
+    }
+    ```
+
+    The planner caches its `ChatState` (keyed by `connectionId`) so that follow-up messages from the user can continue the same session via `ContinueChatSession`.
+  </Step>
+
+  <Step title="Research orchestration">
+    `ResearchProcessor`, a `BackgroundService`, reads events from `IResearchEventsQueue` in a continuous `await foreach` loop. When a `ResearchStartEvent` arrives, it creates a DI scope, resolves a `ResearchOrchestrator`, and calls `StartResearchProcessAsync`.
+
+    ```csharp ResearchProcessor.cs
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await foreach (var researchEvent in _queue.Reader.ReadAllAsync(stoppingToken))
+        {
+            try
+            {
+                await ProcessResearch(researchEvent, stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Error processing research {ResearchId}: {Message}",
+                    researchEvent.ResearchId,
+                    ex.Message
+                );
+            }
+        }
+    }
+    ```
+
+    `ResearchOrchestrator.StartResearchProcessAsync` then:
+    1. Loads the research plan from the database.
+    2. Creates a `ResearchState` via `StateManager.GetOrCreateState`, converting each plan question into a `ResearchQuestion` with a unique ID.
+    3. Sets the first question as `ActiveQuestionId`.
+    4. Builds a `Kernel` with Azure OpenAI chat completion.
+    5. Creates all three agents via `AgentFactory`.
+    6. Wires up `AgentGroupChat` with `ResearchSelectionStrategy` and `ResearchTerminationStrategy`.
+    7. Sends the initial prompt and begins streaming the chat.
+
+    ```csharp ResearchOrchestrator.cs
+    var chat = new AgentGroupChat([.. agents.Values])
+    {
+        ExecutionSettings = new()
+        {
+            SelectionStrategy = new ResearchSelectionStrategy(_manager),
+            TerminationStrategy = new ResearchTerminationStrategy(_manager),
+        },
+    };
+
+    await foreach (var chunk in chat.InvokeStreamingAsync())
+    {
+        // Buffer and forward each agent's message via SignalR
+    }
+    ```
+
+    Every streamed token is buffered per-author. When the author changes, the completed message is saved to `ResearchState.ChatMessages` and pushed to the client via `IClientUpdateCallback.SendAgentChatMessage`.
+  </Step>
+
+  <Step title="Information gathering">
+    The `ResearchSelectionStrategy` routes the first turn to the **Apollo** coordinator. Apollo reads state, confirms questions are pending, and signals that Athena should run next by doing nothing that changes state—the strategy then selects `ResearchEngine`.
+
+    **Athena** calls `GetActiveResearchQuestion` from `StatePlugin` to retrieve the question text, generates 3–5 targeted SERP queries, and calls `ResearchEnginePlugin.ProcessResearchQueries`.
+
+    For each query, the plugin:
+    1. Emits a `WebSearchFeedUpdate` via SignalR so the UI shows the live query.
+    2. Calls `ISearchService.SearchAsync` (Exa AI) to retrieve 5–10 results with parsed content.
+    3. Filters out already-crawled URLs using the `CrawledUrls` set in state.
+    4. Writes an `IngestEvent` to `IIngestEventsQueue`.
+    5. Updates `CrawledUrls` in state.
+    6. Emits one `SearchResultsFeedUpdate` per new result to the UI.
+
+    ```csharp ResearchEnginePlugin.cs
+    public async Task<bool> ProcessResarchQueries(
+        string researchId,
+        List<string> queries
+    )
+    {
+        var state = _state.GetState(researchId);
+        var crawledUrlSet = new HashSet<string>(state.CrawledUrls, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var query in queries)
+        {
+            var searchResponse = await PerformWebSearch(query);
+            var newResults = searchResponse.Results
+                .Where(result => !crawledUrlSet.Contains(result.Url))
+                .ToList();
+
+            if (newResults.Count > 0)
+            {
+                await _ingestQueue.Writer.WriteAsync(
+                    new IngestEvent(Guid.Parse(researchId), newResults)
+                );
+                // update crawledUrlSet and state...
+            }
+        }
+        return true;
+    }
+    ```
+
+    The `IngestProcessor` background service drains the ingest queue independently. For each `IngestEvent`, `IngestEventHandler.HandleIngestAsync` runs all ingestion tasks in parallel using `Task.WhenAll`, so Athena is never blocked waiting for embeddings to be written.
+
+    After all queries for a question are processed, Athena calls `MarkActiveQuestionComplete`. `StateManager.CompleteActiveQuestion` moves the question to `CompletedResearchQuestions`, advances `ActiveQuestionId` to the next pending question, and emits a `TimelineUpdateEvent` to the UI.
+
+    This loop repeats until `PendingResearchQuestions` is empty, at which point the state manager sets `NeedsAnalysis = true`.
+  </Step>
+
+  <Step title="Knowledge gap analysis">
+    When `NeedsAnalysis` is `true`, the `ResearchSelectionStrategy` routes the next turn to **Hermes**. The coordinator first calls `MarkAnalysisStarted` to set `IsAnalyzing = true`, which keeps the strategy pointing at Hermes until the flag is cleared.
+
+    Hermes performs **Self-Reflective RAG**:
+
+    1. Calls `KernelMemoryPlugin.AskMemoryAsync` with a single self-reflective question such as: _"What are the significant knowledge gaps in the current research, and what is a draft Table of Contents?"_
+    2. The Kernel Memory Structured RAG search client retrieves relevant chunks from the vector store, re-ranks them, and synthesizes an answer.
+    3. Hermes parses the answer to identify gaps and calls `AddGapAnalysisQuestions` once per gap question (one at a time to stay within rate limits).
+    4. New questions are appended to `PendingResearchQuestions` and `AllQuestionsInOrder` by `StateManager.AddPendingQuestions`, and `NeedsAnalysis` is reset to `false`.
+    5. Hermes also proposes a Table of Contents and calls `UpdateTableOfContents`.
+    6. Finally, Hermes calls `MarkAnalysisComplete`, clearing `IsAnalyzing` and setting `HasPerformedInitialAnalysis = true`.
+
+    ```csharp KernelMemoryPlugin.cs
+    [KernelFunction]
+    [Description(
+        "Asks a question to the knowledge base (Kernel Memory) and gets a synthesized answer. "
+        + "Use this to get an internal critic of any significant knowledge gaps and a possible table of contents."
+    )]
+    public async Task<string> AskMemoryAsync(
+        [Description("The researchId")] string researchId,
+        [Description(
+            "The SINGLE self reflective question to ask the knowledge base to get "
+            + "knowledge gap analysis results and a draft toc."
+        )] string question,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var response = await _memory.AskAsync(researchId, question, cancellationToken);
+        return response.Result.ToLower();
+    }
+    ```
+
+    If Hermes adds new gap questions, the `ResearchSelectionStrategy` detects pending questions on the next coordinator turn and routes back to Athena. This information-gathering → analysis cycle repeats until Hermes determines that no significant knowledge gaps remain.
+
+    <Note>
+      Strict boundaries prevent infinite loops. `StatePlugin.AddGapAnalysisQuestions` accepts one question at a time, and Hermes's system prompt includes explicit instructions to stop adding questions once the knowledge base is sufficiently comprehensive. `HasInitialAnalysisBeenPerformed` also guards against re-triggering the first analysis pass.
+    </Note>
+  </Step>
+
+  <Step title="Report generation">
+    Once analysis is complete and a TOC exists, Apollo calls `SynthesizeResearchPlugin.SynthesizeFinalReportAsync`, which delegates to `ResearchReportGenerator.GenerateReportAsync`.
+
+    The report generator runs a **two-stage synthesis**:
+
+    **Stage 1 — Per-section mini-reports.** Sections are processed in batches of 3 using `Task.WhenAll`. For each section, `MemoryContext.AskAsync` queries the vector store with a structured prompt asking for key facts, direct quotes, main findings, and source citations relevant to that TOC section. The Kernel Memory Structured RAG client synthesizes a focused mini-report per section.
+
+    ```csharp ResearchReportGenerator.cs
+    var memoryResults = await _memory.AskAsync(
+        researchId,
+        $"For the section '{section}' in research about '{state.Title}', "
+        + "provide research notes that contain the following: "
+        + "1. Key facts and data points (with numbers when available) "
+        + "2. Direct quotes from sources (with attribution) "
+        + "3. Main findings relevant to this specific section "
+        + "4. Cite all sources",
+        cancellationToken
+    );
+    ```
+
+    Source metadata (URL, title, author, published date) is extracted from `MemoryAnswer.RelevantSources` partition tags and collected in a deduplicated list.
+
+    **Stage 2 — Final synthesis.** All section mini-reports are assembled into a single Markdown document with an overview, ordered sections, and a sources list. This document is passed to `SynthesizeFinalReportAsync`, which calls a large-context GPT-4.1 model (up to 32,768 output tokens) with `Prompts.ReportSynthesizerPrompt` to produce the final, fully-cited report.
+
+    ```csharp ResearchReportGenerator.cs
+    private async Task<string> SynthesizeFinalReportAsync(
+        string formattedSections,
+        CancellationToken cancellationToken
+    )
+    {
+        var chatHistory = new ChatHistory();
+        chatHistory.AddSystemMessage(Prompts.ReportSynthesizerPrompt);
+        chatHistory.AddUserMessage(formattedSections);
+
+        var finalResponse = await _chat.GetChatMessageContentAsync(
+            chatHistory,
+            executionSettings: new OpenAIPromptExecutionSettings() { MaxTokens = 32768 },
+            cancellationToken: cancellationToken
+        );
+
+        return finalResponse.Content;
+    }
+    ```
+
+    After saving the report to the database, the generator:
+    - Sends a completion email to the user via `IEmailService`.
+    - Calls `ResearchEventHandler.HandleResearchCompletedWithReport`, which notifies the client via SignalR.
+    - Deletes the Kernel Memory index for this research (`MemoryContext.DeleteIndex`) to free storage.
+    - Calls `StateManager.MarkResearchComplete`, setting `IsComplete = true` and triggering the `ResearchTerminationStrategy` to end the `AgentGroupChat` loop.
+  </Step>
+</Steps>

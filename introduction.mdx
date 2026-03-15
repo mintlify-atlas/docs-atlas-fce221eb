@@ -1,0 +1,67 @@
+---
+title: "Introduction"
+description: "Apollo is a deep research meta-agent that orchestrates a team of specialized AI agents to produce comprehensive, cited research reports."
+keywords: ["apollo", "deep research", "multi-agent", "semantic kernel", "ai research"]
+---
+
+Apollo is a multi-agent research assistant that transforms a single query into a fully structured, cited research report. Rather than relying on a single model call or a rigid, pre-defined template, Apollo orchestrates a collaborative team of specialized AI agents — each with a distinct role — across a dynamic pipeline that plans, searches, ingests, analyzes, and synthesizes information end to end.
+
+Unlike traditional research tools that retrieve a handful of search results and summarize them, Apollo breaks the query down into its fundamental questions, fills knowledge gaps through self-reflective analysis, and produces a report grounded in real, crawled sources.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Apollo running locally in minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand how Apollo's components fit together.
+  </Card>
+  <Card title="Agents" icon="robot" href="/concepts/agents">
+    Meet Apollo, Athena, and Hermes — the agent trio.
+  </Card>
+  <Card title="Research flow" icon="arrows-spin" href="/concepts/research-flow">
+    Follow a query from submission to final report.
+  </Card>
+</CardGroup>
+
+## Key differentiators
+
+### Fully agentic architecture
+
+Apollo does not use a single model to answer a question. It deploys three named agents — **Apollo** (Research Coordinator), **Athena** (Research Engine), and **Hermes** (Research Analyzer) — managed by a Research Orchestrator. The agents collaborate through Semantic Kernel's agent group chat with a shared chat history. A state machine mechanism passes context outside the chat window, preventing token-limit issues and enabling complex, multi-turn workflows.
+
+### Dynamic research planning
+
+Apollo does not start with a pre-defined table of contents. During an initial planning phase it generates the core research questions that need to be answered for the given query, then dynamically structures the final report around what was actually discovered. This produces outputs that are more relevant and accurate than template-driven approaches.
+
+### Advanced RAG and synthesis
+
+Kernel Memory handles chunking, embedding, and vector storage in PostgreSQL with the pgvector extension. A two-stage synthesis process is used: Kernel Memory first synthesizes relevant content per research section, then a large-context LLM (such as GPT-4.1 or Gemini) performs a final synthesis over all sections to produce the complete report while preserving source citations. Self-Reflective RAG techniques drive the knowledge-gap analysis phase, where the vector store critiques its own coverage and triggers additional research cycles when gaps are found.
+
+### Real-time updates
+
+Research events are processed asynchronously via a Research Events Bus built on .NET channels. Background services consume events without blocking the API, so the frontend — connected over SignalR — receives live progress updates as each phase of research completes. For example, Apollo can process new information about one research question while simultaneously analyzing implications for another.
+
+## Named agents
+
+| Agent | Role | Responsibility |
+|---|---|---|
+| **Apollo** | Research Coordinator | Checks state, assigns research questions to the team, manages overall progress |
+| **Athena** | Research Engine | Generates SERP queries, crawls web content via Exa AI, queues results for ingestion |
+| **Hermes** | Research Analyzer | Performs Self-Reflective RAG, identifies knowledge gaps, generates and refines the table of contents, triggers final synthesis |
+
+## Tech stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Backend runtime | .NET 9 / ASP.NET Core | Web API, background services, dependency injection |
+| Agent framework | Semantic Kernel | Agent definitions, group chat orchestration, LLM integration |
+| Memory & RAG | Kernel Memory | Document ingestion, chunking, embedding, structured RAG search |
+| Vector database | PostgreSQL + pgvector | Storing and querying high-dimensional embeddings |
+| LLM provider | Azure AI Foundry (Azure OpenAI) | Reasoning, planning, and per-section synthesis |
+| Final synthesis LLM | Google Gemini (via Google AI API) | Large-context final report synthesis |
+| Web search | Exa AI | Neural web search and content retrieval |
+| Real-time transport | SignalR | Streaming live research progress to the browser |
+| Frontend | React 19 + Vite | Single-page application for submitting queries and reading reports |
+| Frontend routing | TanStack Router + TanStack Query | Type-safe routing and server-state management |
+| Frontend deployment | Vercel / Netlify | Static asset hosting with SPA routing rewrite rules |
+| Container | Docker (multi-stage build) | Portable backend packaging for cloud deployment |

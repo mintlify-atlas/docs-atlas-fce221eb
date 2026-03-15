@@ -1,0 +1,411 @@
+---
+title: "Real-time updates"
+description: "How Apollo uses .NET channels, SignalR, and the React client to stream live research progress to the browser."
+---
+
+Apollo streams research progress live to the browser using [ASP.NET Core SignalR](https://learn.microsoft.com/en-us/aspnet/core/signalr/introduction). As the agent pipeline runs in the backend, structured events travel from .NET channels through a strongly-typed SignalR hub and arrive in the React component tree in real time.
+
+## Architecture overview
+
+```
+Agent pipeline
+     │
+     │  IClientUpdateCallback methods
+     ▼
+ClientUpdateCallback          ← translates agent events to SignalR calls
+     │
+     │  IHubContext<ResearchHub, IResearchHubClient>
+     ▼
+ResearchHub (/hubs/research)  ← SignalR hub, groups per research ID
+     │
+     │  WebSocket / long-poll
+     ▼
+React client                  ← @microsoft/signalr HubConnection
+     │
+     ▼
+component state updates       ← ResearchFeed, AgentChat, route component
+```
+
+## Hub endpoint
+
+The SignalR hub is registered in `Program.cs` at:
+
+```
+/hubs/research
+```
+
+Clients connect to `{VITE_SERVER_URL}/hubs/research`.
+
+## How events flow
+
+<Steps>
+  <Step title="Agent calls IClientUpdateCallback">
+    The research agent pipeline calls methods on `IClientUpdateCallback` to emit structured events as work progresses — feed updates, timeline state changes, agent-to-agent chat messages, and completion notifications.
+
+    ```csharp title="Apollo.Agents/Contracts/IClientUpdateCallback.cs (interface)"
+    void StreamPlannerResponse(string connectionId, string? message);
+    void SendTimelineUpdate(TimelineUpdateEvent update);
+    void SendResearchFeedUpdate(ResearchFeedUpdateEvent update);
+    void SendAgentChatMessage(AgentChatMessageEvent message);
+    ```
+  </Step>
+
+  <Step title="ClientUpdateCallback routes to SignalR groups">
+    `ClientUpdateCallback` implements the interface and forwards every event to the correct SignalR group or connection via `IHubContext`:
+
+    ```csharp title="Apollo.Api/Features/Research/ClientUpdateCallback.cs"
+    public class ClientUpdateCallback : IClientUpdateCallback
+    {
+        private readonly IHubContext<ResearchHub, IResearchHubClient> _hubContext;
+
+        public void SendTimelineUpdate(TimelineUpdateEvent update)
+        {
+            // Sent to all clients watching this research ID
+            _hubContext.Clients.Group(update.ResearchId).ReceiveTimelineUpdate(update);
+        }
+
+        public void SendResearchFeedUpdate(ResearchFeedUpdateEvent update)
+        {
+            _hubContext.Clients.Group(update.ResearchId).ReceiveResearchFeedUpdate(update);
+        }
+
+        public void SendAgentChatMessage(AgentChatMessageEvent message)
+        {
+            _hubContext.Clients.Group(message.ResearchId).ReceiveAgentChatMessage(message);
+        }
+    }
+    ```
+
+    Completion events (e.g. `ResearchCompletedWithReport`) are dispatched by `ResearchNotifier` directly to the authenticated user rather than a group:
+
+    ```csharp title="Apollo.Api/Features/Research/ResearchNotifier.cs"
+    public async Task NotifyResearchCompletedWithReport(
+        string userId,
+        Guid researchId,
+        ResearchReportResponse report)
+    {
+        await _hubContext.Clients.User(userId).ResearchCompletedWithReport(researchId, report);
+    }
+    ```
+  </Step>
+
+  <Step title="ResearchHub manages group membership">
+    `ResearchHub` exposes hub methods that the client calls to join or leave a research-specific group:
+
+    ```csharp title="Apollo.Api/Features/Research/ResearchHub.cs"
+    public class ResearchHub : Hub<IResearchHubClient>
+    {
+        public async Task JoinResearchStream(string researchId)
+        {
+            await Groups.AddToGroupAsync(Context.ConnectionId, researchId);
+        }
+
+        public async Task LeaveResearchStream(string researchId)
+        {
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, researchId);
+        }
+    }
+    ```
+
+    Each group is named after the research `Guid`. Only clients that have joined the group receive its events.
+  </Step>
+
+  <Step title="React client connects and joins the stream">
+    When the research detail route mounts and the research is still in progress, the component builds a `HubConnection` and joins the research group:
+
+    ```typescript title="src/routes/__app/research/$id/index.tsx — connection setup"
+    import * as signalR from "@microsoft/signalr";
+    import { config } from "../../../../../config";
+
+    const newConnection = new signalR.HubConnectionBuilder()
+      .withUrl(`${config.url}/hubs/research`)
+      .withAutomaticReconnect()
+      .build();
+
+    newConnection
+      .start()
+      .then(() => {
+        // Join the group for this specific research session
+        return newConnection.invoke("JoinResearchStream", researchId);
+      })
+      .catch((err) => console.error("SignalR Connection Error: ", err));
+    ```
+
+    `withAutomaticReconnect()` enables the SignalR client to transparently reconnect if the WebSocket drops.
+  </Step>
+
+  <Step title="Components subscribe to specific events">
+    The `HubConnection` is passed as a prop to child components. Each component registers its own event listeners:
+
+    **ResearchFeed** — subscribes to feed and timeline updates:
+
+    ```typescript title="src/components/research/feed/ResearchFeed.tsx"
+    useEffect(() => {
+      if (!connection) return;
+
+      connection.on("ReceiveResearchFeedUpdate", (update: ResearchFeedUpdate) => {
+        setFeedUpdates((prev) => [...prev, update]);
+      });
+
+      connection.on("ReceiveTimelineUpdate", (update: TimelineUpdate) => {
+        setTimelineItems(update.items);
+      });
+
+      return () => {
+        connection.off("ReceiveResearchFeedUpdate");
+        connection.off("ReceiveTimelineUpdate");
+      };
+    }, [connection]);
+    ```
+
+    **AgentChat** — subscribes to agent-to-agent messages:
+
+    ```typescript title="src/components/research/AgentChat.tsx"
+    useEffect(() => {
+      if (!connection) return;
+
+      connection.on("ReceiveAgentChatMessage", (message: AgentChatMessage) => {
+        setMessages((prev) => [...prev, message]);
+      });
+
+      return () => {
+        connection.off("ReceiveAgentChatMessage");
+      };
+    }, [connection]);
+    ```
+
+    **Route component** — handles research completion:
+
+    ```typescript title="src/routes/__app/research/$id/index.tsx — completion handler"
+    newConnection.on(
+      "ResearchCompletedWithReport",
+      (researchId: string, report: ResearchReport) => {
+        setResearch((prev) => ({
+          ...prev,
+          status: ResearchStatus.Complete,
+          report,
+        }));
+      }
+    );
+    ```
+  </Step>
+
+  <Step title="Cleanup on unmount">
+    When the component unmounts the connection is gracefully stopped and the client leaves the group:
+
+    ```typescript title="src/routes/__app/research/$id/index.tsx — cleanup"
+    return () => {
+      if (newConnection) {
+        newConnection
+          .invoke("LeaveResearchStream", researchId)
+          .catch(console.error);
+        newConnection.stop();
+      }
+    };
+    ```
+  </Step>
+</Steps>
+
+## Event reference
+
+All events extend the base `ClientUpdateEvent` record, which carries `ResearchId` (the target group) and a UTC `Timestamp`.
+
+### TimelineUpdateEvent
+
+Emitted when the research plan's progress changes — e.g. a question moves from `Pending` to `InProgress`.
+
+```csharp title="Apollo.Agents/Contracts/ClientUpdateEvents.cs"
+public record TimelineUpdateEvent : ClientUpdateEvent
+{
+    public List<TimelineItem> Items { get; init; } = new();
+}
+
+public record TimelineItem
+{
+    public string Id { get; init; } = null!;
+    public string Text { get; init; } = null!;       // question / analysis / synthesis label
+    public TimelineItemType Type { get; init; }       // Question | Analysis | Synthesis
+    public bool Active { get; init; }                 // currently being worked on
+    public TimelineItemStatus Status { get; init; }   // Pending | InProgress | Completed
+}
+```
+
+Client-side event name: **`ReceiveTimelineUpdate`**
+
+---
+
+### ResearchFeedUpdateEvent (polymorphic)
+
+A discriminated union of feed events. The `$type` discriminator on the JSON payload identifies the concrete subtype.
+
+| Subtype | Client event name | Key fields |
+|---|---|---|
+| `ProgressMessageFeedUpdate` | `ReceiveResearchFeedUpdate` | `Message: string` — a human-readable progress message |
+| `WebSearchFeedUpdate` | `ReceiveResearchFeedUpdate` | `Query: string` — the search query being executed |
+| `SearchResultsFeedUpdate` | `ReceiveResearchFeedUpdate` | `Results: SearchResultItemContract[]` — list of web results with `Id`, `Title`, `Url`, `Icon`, `Snippet`, `Highlights` |
+| `SnippetFeedUpdate` | `ReceiveResearchFeedUpdate` | `Content: string`, `Highlights: string[]?` — extracted text snippet |
+| `TableOfContentsFeedUpdate` | `ReceiveResearchFeedUpdate` | `Sections: string[]` — planned report sections |
+
+```csharp title="Apollo.Agents/Contracts/ClientUpdateEvents.cs — ResearchFeedUpdateEvent subtypes"
+public record ProgressMessageFeedUpdate : ResearchFeedUpdateEvent
+{
+    public string Message { get; init; } = null!;
+}
+
+public record WebSearchFeedUpdate : ResearchFeedUpdateEvent
+{
+    public string Query { get; init; } = null!;
+}
+
+public record SearchResultsFeedUpdate : ResearchFeedUpdateEvent
+{
+    public List<SearchResultItemContract> Results { get; init; } = new();
+}
+
+public record SnippetFeedUpdate : ResearchFeedUpdateEvent
+{
+    public string Content { get; init; } = null!;
+    public List<string>? Highlights { get; init; }
+}
+
+public record TableOfContentsFeedUpdate : ResearchFeedUpdateEvent
+{
+    public List<string> Sections { get; init; } = new();
+}
+```
+
+The TypeScript union type on the client:
+
+```typescript title="src/lib/types/research.ts — ResearchFeedUpdate union"
+export type ResearchFeedUpdate =
+  | ProgressMessageUpdate    // type: ResearchFeedUpdateType.Message
+  | WebSearchUpdate          // type: ResearchFeedUpdateType.Searching
+  | SearchResultsUpdate      // type: ResearchFeedUpdateType.SearchResults
+  | SnippetUpdate            // type: ResearchFeedUpdateType.Snippet
+  | TableOfContentsUpdate;   // type: ResearchFeedUpdateType.TableOfContents
+```
+
+---
+
+### AgentChatMessageEvent
+
+Emitted whenever one of the research agents (Coordinator, Engine, Analyzer) broadcasts a message to the group chat.
+
+```csharp title="Apollo.Agents/Contracts/ClientUpdateEvents.cs"
+public record AgentChatMessageEvent : ClientUpdateEvent
+{
+    public string Author { get; init; } = null!;   // e.g. "ResearchCoordinator"
+    public string Message { get; init; } = null!;  // markdown-formatted message body
+}
+```
+
+Client-side event name: **`ReceiveAgentChatMessage`**
+
+The frontend maps `Author` to a display persona:
+
+```typescript title="src/components/research/AgentChat.tsx — agent personas"
+const agentPersonas: Record<string, { name: string; avatar: string }> = {
+  ResearchCoordinator: { name: "Apollo",  avatar: "/agents/agent1.jpg" },
+  ResearchEngine:      { name: "Athena",  avatar: "/agents/agent2.jpg" },
+  ResearchAnalyzer:    { name: "Hermes",  avatar: "/agents/agent3.jpg" },
+};
+```
+
+---
+
+### ResearchCompletedWithReport
+
+Sent directly to the authenticated user (not the group) when the full research report is ready.
+
+```csharp title="Apollo.Api/Features/Research/ResearchHub.cs — IResearchHubClient interface"
+Task ResearchCompletedWithReport(Guid researchId, ResearchReportResponse report);
+```
+
+Client-side event name: **`ResearchCompletedWithReport`**
+
+When received, the frontend transitions the view from the live feed to the rendered `ResearchReport` component.
+
+---
+
+### ResearchSaved
+
+Emitted by `ResearchNotifier` when the research record has been persisted to the database and is ready to be fetched via the REST API.
+
+```csharp title="Apollo.Api/Features/Research/ResearchHub.cs — IResearchHubClient interface"
+Task ResearchSaved(Guid researchId);
+```
+
+Client-side event name: **`ResearchSaved`**
+
+## Complete TypeScript connection example
+
+The following shows a self-contained example of connecting to the hub, joining a research stream, and handling all events:
+
+```typescript title="signalr-example.ts"
+import * as signalR from "@microsoft/signalr";
+import type {
+  ResearchFeedUpdate,
+  AgentChatMessage,
+  TimelineUpdate,
+  ResearchReport,
+} from "./src/lib/types/research";
+import { ResearchStatus } from "./src/lib/types/research";
+
+const SERVER_URL = import.meta.env.VITE_SERVER_URL;
+
+const connection = new signalR.HubConnectionBuilder()
+  .withUrl(`${SERVER_URL}/hubs/research`)
+  .withAutomaticReconnect()
+  .build();
+
+// Register event handlers before starting
+connection.on("ReceiveTimelineUpdate", (update: TimelineUpdate) => {
+  console.log("Timeline:", update.items);
+});
+
+connection.on("ReceiveResearchFeedUpdate", (update: ResearchFeedUpdate) => {
+  console.log("Feed update:", update.type, update);
+});
+
+connection.on("ReceiveAgentChatMessage", (message: AgentChatMessage) => {
+  console.log(`[${message.author}]: ${message.message}`);
+});
+
+connection.on(
+  "ResearchCompletedWithReport",
+  (researchId: string, report: ResearchReport) => {
+    console.log("Research complete:", researchId, report.title);
+  }
+);
+
+connection.on("ResearchSaved", (researchId: string) => {
+  console.log("Research saved:", researchId);
+});
+
+// Start and join the research group
+await connection.start();
+await connection.invoke("JoinResearchStream", "<research-id>");
+
+// When done, leave and stop
+await connection.invoke("LeaveResearchStream", "<research-id>");
+await connection.stop();
+```
+
+<Note>
+Always register event handlers with `connection.on(...)` **before** calling `connection.start()`. Handlers registered after the connection starts may miss events that arrive during the startup handshake.
+</Note>
+
+## Cached updates on reconnect
+
+If a user navigates away and returns to an in-progress research session, the frontend fetches cached updates from the REST API before connecting to SignalR:
+
+```typescript title="src/routes/__app/research/$id/index.tsx — loader"
+if (research.status === ResearchStatus.InProgress) {
+  const updatesResult = await getResearchUpdates(params.id);
+  if (updatesResult.success) {
+    updates = updatesResult.data; // { feedUpdates, chatMessages }
+  }
+}
+```
+
+The `GET /api/research/{id}/updates` endpoint returns previously received `feedUpdates` and `chatMessages` so the feed is not empty on reconnect. Live SignalR events are then appended on top of this initial state.

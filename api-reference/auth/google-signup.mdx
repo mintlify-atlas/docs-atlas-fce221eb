@@ -1,0 +1,137 @@
+---
+title: "Sign in with Google"
+description: "Authenticate with Apollo using a Google OAuth access token obtained from the Google Identity frontend flow."
+---
+
+<Badge color="blue">POST</Badge> `/api/auth/google-signup`
+
+Exchanges a Google OAuth access token for an Apollo session. The backend uses the token to fetch the authenticated user's profile from Google's `userinfo` endpoint, then either creates a new Apollo account or signs in to the existing one. Either way, a session cookie is issued on success.
+
+## Authentication
+
+None required. This endpoint is public. The Google access token itself is the credential.
+
+---
+
+## OAuth flow overview
+
+<Steps>
+  <Step title="Obtain a Google access token">
+    Use the Google Identity Services JavaScript SDK (or a native OAuth library) in your frontend to prompt the user and receive a Google OAuth access token.
+  </Step>
+  <Step title="Send the token to Apollo">
+    POST the access token to `/api/auth/google-signup`.
+  </Step>
+  <Step title="Apollo verifies with Google">
+    The backend calls `https://www.googleapis.com/oauth2/v3/userinfo` with the access token to retrieve the user's verified email, name, and avatar.
+  </Step>
+  <Step title="Account created or matched">
+    If no Apollo account exists for that email, one is created automatically. If an account already exists (even one originally registered via email), it is linked to Google and signed in.
+  </Step>
+  <Step title="Session cookie issued">
+    A signed JWT is stored as an HTTP-only cookie. The user data is returned in the response body.
+  </Step>
+</Steps>
+
+---
+
+## Request body
+
+<ParamField body="AccessToken" type="string" required>
+  A valid Google OAuth **access token** obtained from the Google Identity sign-in flow. This is **not** a Google ID token (JWT) — it is the opaque access token used to call Google APIs.
+</ParamField>
+
+---
+
+## Response
+
+Returns a `UserDataResponse` object on success (`200 OK`).
+
+<ResponseField name="id" type="string" required>
+  UUID (version 7) uniquely identifying the user in Apollo.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  Email address obtained from the Google profile.
+</ResponseField>
+
+<ResponseField name="username" type="string">
+  Display name sourced from the Google profile's `name` field.
+</ResponseField>
+
+<ResponseField name="avatarUrl" type="string">
+  Profile picture URL sourced from the Google profile's `picture` field.
+</ResponseField>
+
+<ResponseField name="isEmailConfirmed" type="boolean" required>
+  Reflects the `email_verified` claim from Google. Typically `true` for Google accounts.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 timestamp of when the Apollo account was created (UTC).
+</ResponseField>
+
+<ResponseField name="authProvider" type="string" required>
+  Always `"Google"` after a successful Google sign-in.
+</ResponseField>
+
+<Note>
+  A `apollo_access_token` HTTP-only cookie is set on the response with a 14-day expiry. Include `credentials: 'include'` (or the equivalent in your HTTP client) on all subsequent requests to send this cookie automatically.
+</Note>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `400 Bad Request` | The access token is missing, expired, or rejected by Google; Google returns invalid or incomplete user data; or an unexpected error occurs during the flow. |
+
+Error responses return a JSON array of human-readable strings:
+
+```json
+["Failed to fetch user data from Google API"]
+```
+
+Possible error messages include:
+
+- `"Invalid Google access token"` — `AccessToken` is null or empty.
+- `"Failed to fetch user data from Google API"` — Google's userinfo endpoint returned a non-2xx response.
+- `"Invalid user data received from Google"` — Google returned a response that could not be parsed or contained no email.
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request POST \
+  --url https://your-apollo-instance.com/api/auth/google-signup \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "AccessToken": "ya29.a0AfH6SM..."
+  }'
+```
+
+```typescript TypeScript
+// Assumes you have already obtained a Google access token,
+// e.g. via the Google Identity Services library.
+async function signInWithGoogle(googleAccessToken: string) {
+  const response = await fetch('/api/auth/google-signup', {
+    method: 'POST',
+    credentials: 'include', // required so the session cookie is stored
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ AccessToken: googleAccessToken }),
+  });
+
+  if (!response.ok) {
+    const errors: string[] = await response.json();
+    throw new Error(errors.join(', '));
+  }
+
+  return response.json(); // UserDataResponse
+}
+```
+
+</CodeGroup>

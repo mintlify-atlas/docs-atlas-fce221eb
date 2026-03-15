@@ -1,0 +1,124 @@
+---
+title: "Sign up with email"
+description: "Create a new Apollo account using an email address, username, and password."
+---
+
+<Badge color="blue">POST</Badge> `/api/auth/signup`
+
+Creates a new user account with email and password credentials. On success, a signed JWT is issued and stored as an HTTP-only cookie — no token handling required on the client.
+
+## Authentication
+
+None required. This endpoint is public.
+
+---
+
+## Request body
+
+<ParamField body="Username" type="string" required>
+  Display name for the new account. Must be at least 3 characters.
+</ParamField>
+
+<ParamField body="Email" type="string" required>
+  Email address for the account. Must be a valid email format and must not already be registered.
+</ParamField>
+
+<ParamField body="Password" type="string" required>
+  Password for the account. Rules:
+  - Minimum 6 characters
+  - Maximum 60 characters
+  - At least one uppercase letter
+  - At least one special character (spaces excluded)
+</ParamField>
+
+---
+
+## Response
+
+Returns a `UserDataResponse` object on success (`200 OK`).
+
+<ResponseField name="id" type="string" required>
+  UUID (version 7) uniquely identifying the user.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  Email address associated with the account.
+</ResponseField>
+
+<ResponseField name="username" type="string">
+  Display name for the user. May be `null` if not set.
+</ResponseField>
+
+<ResponseField name="avatarUrl" type="string">
+  URL of the user's avatar image. Empty string if none has been set.
+</ResponseField>
+
+<ResponseField name="isEmailConfirmed" type="boolean" required>
+  Whether the user has confirmed their email address. Defaults to `false` on signup.
+</ResponseField>
+
+<ResponseField name="createdAt" type="string" required>
+  ISO 8601 timestamp of when the account was created (UTC).
+</ResponseField>
+
+<ResponseField name="authProvider" type="string" required>
+  Authentication method used. For this endpoint the value is always `"Email"`.
+</ResponseField>
+
+<Note>
+  A `apollo_access_token` HTTP-only cookie is set on the response with a 14-day expiry. Subsequent authenticated requests are authorized via this cookie — you do not need to extract or manually attach a token.
+</Note>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `400 Bad Request` | Validation failed (see body for messages) or the email is already registered. |
+
+Error responses return a JSON array of human-readable strings:
+
+```json
+["Password must be at least 6 characters", "Email must be a valid email addresss"]
+```
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request POST \
+  --url https://your-apollo-instance.com/api/auth/signup \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "Username": "ada_lovelace",
+    "Email": "ada@example.com",
+    "Password": "Secure!Pass1"
+  }'
+```
+
+```typescript TypeScript
+const response = await fetch('/api/auth/signup', {
+  method: 'POST',
+  credentials: 'include', // required so the cookie is stored
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    Username: 'ada_lovelace',
+    Email: 'ada@example.com',
+    Password: 'Secure!Pass1',
+  }),
+});
+
+if (!response.ok) {
+  const errors: string[] = await response.json();
+  console.error(errors);
+} else {
+  const user = await response.json();
+  console.log(user.id, user.email);
+}
+```
+
+</CodeGroup>

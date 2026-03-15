@@ -1,0 +1,113 @@
+---
+title: "List research"
+description: "Return all research sessions belonging to the authenticated user, ordered by most recently started."
+---
+
+<Badge color="green">GET</Badge> `/api/research`
+
+Returns every research session owned by the authenticated user, sorted by `startedAt` descending. Each item includes the full plan and report (when complete). For large result sets, use the paginated [Research history](/api-reference/research/history) endpoint instead.
+
+## Authentication
+
+Required. The request must include the `apollo_access_token` HTTP-only cookie.
+
+---
+
+## Response
+
+Returns a JSON array of `ResearchResponse` objects on success (`200 OK`). An empty array is returned when the user has no research sessions.
+
+Each item in the array has the following shape:
+
+<ResponseField name="id" type="string" required>
+  UUID that uniquely identifies the research session.
+</ResponseField>
+
+<ResponseField name="title" type="string" required>
+  Short label for the research session.
+</ResponseField>
+
+<ResponseField name="description" type="string" required>
+  Longer description of the research objective.
+</ResponseField>
+
+<ResponseField name="startedAt" type="string" required>
+  ISO 8601 UTC timestamp of when the session was created.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Current status. One of `"InProgress"` or `"Complete"`.
+</ResponseField>
+
+<ResponseField name="plan" type="object" required>
+  The research plan associated with this session.
+  <Expandable title="plan properties">
+    <ResponseField name="id" type="string" required>
+      UUID of the plan record.
+    </ResponseField>
+    <ResponseField name="researchId" type="string" required>
+      UUID of the parent research session.
+    </ResponseField>
+    <ResponseField name="questions" type="string[]" required>
+      Research questions the agent pipeline is investigating.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="report" type="object">
+  The generated report. `null` while the session is `InProgress`.
+  <Expandable title="report properties">
+    <ResponseField name="id" type="string" required>
+      UUID of the report record.
+    </ResponseField>
+    <ResponseField name="researchId" type="string" required>
+      UUID of the parent research session.
+    </ResponseField>
+    <ResponseField name="content" type="string" required>
+      Full Markdown content of the generated report.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `401 Unauthorized` | No valid session cookie was sent, or the session has expired. |
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request GET \
+  --url https://your-apollo-instance.com/api/research \
+  --cookie 'apollo_access_token=<your-token>'
+```
+
+```typescript TypeScript
+const response = await fetch('/api/research', {
+  method: 'GET',
+  credentials: 'include',
+});
+
+if (!response.ok) {
+  throw new Error(`Unexpected status ${response.status}`);
+}
+
+const sessions = await response.json();
+
+for (const session of sessions) {
+  console.log(session.id, session.title, session.status);
+
+  if (session.status === 'Complete' && session.report) {
+    console.log('Report ID:', session.report.id);
+  }
+}
+```
+
+</CodeGroup>

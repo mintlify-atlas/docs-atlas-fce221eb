@@ -1,0 +1,231 @@
+---
+title: "Database configuration"
+description: "Configure PostgreSQL with the pgvector extension for Apollo's relational data and vector search, and apply EF Core migrations."
+keywords: ["database", "postgresql", "pgvector", "entity framework", "migrations", "connection string"]
+---
+
+Apollo requires PostgreSQL (v15 or later) with the **pgvector** extension. Two connection strings are used:
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `DATABASE_URL` | Entity Framework Core | Stores users, research sessions, plans, and reports |
+| `VECTOR_DB_URL` | Kernel Memory | Stores chunked text and high-dimensional embeddings for RAG search |
+
+Both variables can point to the same PostgreSQL instance and database. They are read independently so you can split them across different hosts for workload isolation if needed.
+
+## Connection string format
+
+Apollo uses Npgsql (the .NET PostgreSQL driver) for both connections. The connection string format is:
+
+```text Connection string format
+Host=<hostname>;Port=<port>;Database=<database>;Username=<user>;Password=<password>
+```
+
+For a typical local setup:
+
+```env Apollo.Api/.env
+DATABASE_URL=Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres
+VECTOR_DB_URL=Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres
+```
+
+For a managed cloud database, the hostname, port, and credentials come from your provider's connection details panel — see [Cloud database setup](#cloud-database-setup) below.
+
+## Data models
+
+Apollo's Entity Framework Core context (`ApolloDbContext`) exposes four `DbSet` properties:
+
+### Users
+
+Stores registered accounts. Supports both email/password and Google OAuth sign-in.
+
+| Column | Type | Notes |
+|---|---|---|
+| `Id` | `uuid` | Version 7 UUID (time-ordered). Primary key. |
+| `AvatarUrl` | `text` | Profile picture URL. |
+| `Username` | `text` | Display name. |
+| `Email` | `text` | Unique email address. |
+| `PasswordHash` | `text` | BCrypt hash. Empty for OAuth users. |
+| `IsEmailConfirmed` | `boolean` | Set to `true` after email verification. |
+| `CreatedAt` | `timestamp with time zone` | UTC creation timestamp. |
+| `AuthProvider` | `integer` | `0` = Email, `1` = Google. |
+
+### Research
+
+Represents a single research job submitted by a user.
+
+| Column | Type | Notes |
+|---|---|---|
+| `Id` | `uuid` | Primary key. |
+| `Title` | `text` | Short research title. |
+| `Description` | `text` | Full research query / description. |
+| `StartedAt` | `timestamp with time zone` | When the orchestration started. |
+| `CompletedAt` | `timestamp with time zone` | When synthesis finished. |
+| `Status` | `integer` | `0` = InProgress, `1` = Complete. |
+| `UserId` | `uuid` | Foreign key → `Users.Id` (cascade delete). |
+
+### ResearchPlans
+
+Holds the list of research questions generated during the planning phase. One plan per research session.
+
+| Column | Type | Notes |
+|---|---|---|
+| `Id` | `uuid` | Primary key. |
+| `Questions` | `text[]` | PostgreSQL text array of research sub-questions. |
+| `ResearchId` | `uuid` | Foreign key → `Research.Id` (cascade delete, unique). |
+
+### ResearchReports
+
+Stores the final synthesized report content. Created when the Research Coordinator calls `SynthesizeFinalReportAsync`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `Id` | `uuid` | Primary key. |
+| `Content` | `text` | Full Markdown report content. |
+| `ResearchId` | `uuid` | Foreign key → `Research.Id` (cascade delete, unique). |
+
+## Local PostgreSQL setup
+
+<Tabs>
+  <Tab title="Local PostgreSQL">
+    <Steps>
+      <Step title="Install PostgreSQL">
+        Install PostgreSQL 15 or later. Verify the installation:
+
+        ```bash Verify PostgreSQL version
+        psql --version
+        ```
+      </Step>
+
+      <Step title="Create the database">
+        Connect to PostgreSQL as the `postgres` superuser and create the Apollo database:
+
+        ```sql Create database
+        CREATE DATABASE "ApolloDb";
+        ```
+      </Step>
+
+      <Step title="Enable pgvector">
+        Connect to the `ApolloDb` database and install the pgvector extension. pgvector must be installed on the PostgreSQL server first — on Ubuntu/Debian install the `postgresql-<version>-pgvector` package; on macOS use `brew install pgvector`.
+
+        ```sql Enable pgvector extension
+        \c ApolloDb
+        CREATE EXTENSION IF NOT EXISTS vector;
+        ```
+      </Step>
+
+      <Step title="Set connection strings">
+        Add both connection strings to `Apollo.Api/.env`:
+
+        ```env Apollo.Api/.env
+        DATABASE_URL=Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres
+        VECTOR_DB_URL=Host=localhost;Port=5432;Database=ApolloDb;Username=postgres;Password=postgres
+        ```
+      </Step>
+
+      <Step title="Install the EF Core CLI">
+        If you do not already have `dotnet-ef` installed:
+
+        ```bash Install EF Core tools
+        dotnet tool install --global dotnet-ef
+        ```
+      </Step>
+
+      <Step title="Run migrations">
+        Apply all pending migrations to create the schema:
+
+        ```bash Run database migrations
+        dotnet ef database update \
+          --project Apollo.Data/Apollo.Data.csproj \
+          --startup-project Apollo.Api/Apollo.Api.csproj
+        ```
+
+        This runs the `init` migration (`20250516175603_init`) which creates the `Users`, `Research`, `ResearchPlans`, and `ResearchReports` tables with all foreign key constraints and indexes.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Cloud database">
+    <Steps>
+      <Step title="Provision a PostgreSQL instance">
+        Choose a managed PostgreSQL provider. All of the following support pgvector:
+
+        - **[Supabase](https://supabase.com)** — pgvector enabled by default on all instances. Free tier available.
+        - **[Neon](https://neon.tech)** — serverless PostgreSQL with pgvector support. Generous free tier.
+        - **[Render Postgres](https://render.com/docs/databases)** — managed PostgreSQL. Works seamlessly alongside a Render web service.
+
+        Create a new PostgreSQL database in your chosen provider's dashboard.
+      </Step>
+
+      <Step title="Enable pgvector">
+        Most managed providers either enable pgvector automatically or provide a one-click toggle. If you need to enable it manually, run:
+
+        ```sql Enable pgvector extension
+        CREATE EXTENSION IF NOT EXISTS vector;
+        ```
+
+        Connect using the connection string from your provider's dashboard to run this command.
+      </Step>
+
+      <Step title="Copy the connection string">
+        Retrieve the connection string from your provider. It typically looks like:
+
+        ```text Managed database connection string
+        Host=db.abcdefgh.supabase.co;Port=5432;Database=postgres;Username=postgres;Password=your-password
+        ```
+
+        Set both `DATABASE_URL` and `VECTOR_DB_URL` to this value (they can share the same database).
+      </Step>
+
+      <Step title="Run migrations">
+        Apply migrations from your local machine against the remote database:
+
+        ```bash Run migrations against remote database
+        DATABASE_URL="Host=db.abcdefgh.supabase.co;Port=5432;Database=postgres;Username=postgres;Password=your-password" \
+        dotnet ef database update \
+          --project Apollo.Data/Apollo.Data.csproj \
+          --startup-project Apollo.Api/Apollo.Api.csproj
+        ```
+
+        Or set `DATABASE_URL` in your shell environment before running the command.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Adding new migrations
+
+When the data model changes, generate a new migration:
+
+```bash Create a new migration
+dotnet ef migrations add <MigrationName> \
+  --project Apollo.Data/Apollo.Data.csproj \
+  --startup-project Apollo.Api/Apollo.Api.csproj
+```
+
+Then apply it:
+
+```bash Apply the migration
+dotnet ef database update \
+  --project Apollo.Data/Apollo.Data.csproj \
+  --startup-project Apollo.Api/Apollo.Api.csproj
+```
+
+<Note>
+  Migrations are stored in `Apollo.Data/Migrations/`. Each migration file is a partial `Migration` class with `Up` and `Down` methods generated by EF Core. The model snapshot at `Apollo.Data/Migrations/ApolloDbContextModelSnapshot.cs` records the full current schema and is updated automatically each time you add a migration.
+</Note>
+
+## How `ServiceExtensions.ConfigureDatabase` works
+
+The database connection is registered in `Apollo.Api/Extensions/ServiceExtensions.cs`:
+
+```csharp ServiceExtensions.cs
+public static IServiceCollection ConfigureDatabase(this IServiceCollection services)
+{
+    services.AddDbContext<ApolloDbContext>(options =>
+        options.UseNpgsql(AppConfig.DatabaseOptions.ConnectionString)
+    );
+    return services;
+}
+```
+
+`AppConfig.DatabaseOptions.ConnectionString` reads `DATABASE_URL` from the environment and throws an `Exception` immediately if the variable is not set. This means a missing `DATABASE_URL` will crash the API on startup — it will not start in a degraded state.

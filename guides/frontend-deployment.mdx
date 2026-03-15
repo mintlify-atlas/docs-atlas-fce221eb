@@ -1,0 +1,213 @@
+---
+title: "Frontend deployment"
+description: "Build and deploy the Apollo React client to Vercel or Netlify."
+---
+
+The Apollo frontend is a React 19 single-page application built with [Vite](https://vitejs.dev/). It uses [TanStack Router](https://tanstack.com/router) for type-safe file-based routing, [TanStack Query](https://tanstack.com/query) for server state management, [HeroUI](https://www.heroui.com/) for components, and [Tailwind CSS](https://tailwindcss.com/) for styling. Real-time updates are delivered over [SignalR](https://learn.microsoft.com/en-us/aspnet/core/signalr/introduction) via `@microsoft/signalr`.
+
+## Project structure overview
+
+```
+Apollo.Client/
+├── src/
+│   ├── routes/          # TanStack Router file-based routes
+│   ├── components/      # React components
+│   ├── lib/
+│   │   ├── services/    # API service functions
+│   │   ├── types/       # TypeScript type definitions
+│   │   ├── hooks/       # Custom React hooks
+│   │   └── state/       # TanStack Store state
+│   ├── contexts/        # React context providers
+│   ├── providers.tsx    # Root provider tree
+│   └── main.tsx         # Application entry point
+├── config.ts            # Runtime configuration (env vars)
+├── vercel.json          # Vercel SPA rewrite rule
+└── package.json
+```
+
+## Runtime configuration
+
+All runtime configuration is read from Vite environment variables and exported from `config.ts`:
+
+```typescript title="config.ts"
+export const config = {
+    url: import.meta.env.VITE_SERVER_URL as string,
+    googleClientId: import.meta.env.VITE_GOOGLE_CLIENT_ID as string,
+    isProd: import.meta.env.MODE === "production",
+    isDev: import.meta.env.MODE === "development",
+  } as const;
+```
+
+### Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `VITE_SERVER_URL` | Yes | Full URL of the deployed Apollo API (e.g. `https://apollo-api.onrender.com`). Must **not** have a trailing slash. Used for all HTTP requests and as the SignalR hub base URL. |
+| `VITE_GOOGLE_CLIENT_ID` | Yes | Google OAuth 2.0 client ID. Must match the client ID configured on the backend. Used by `@react-oauth/google` to render the sign-in button. |
+
+<Warning>
+`VITE_SERVER_URL` is embedded into the JavaScript bundle at build time. If the backend URL changes you must rebuild and redeploy the frontend.
+</Warning>
+
+## Building the frontend
+
+Install dependencies and build:
+
+```bash title="Install and build with Bun"
+bun install
+bun run build
+```
+
+Or with npm:
+
+```bash title="Install and build with npm"
+npm install
+npm run build
+```
+
+The build script runs `vite build && tsc`. The compiled output lands in `dist/`.
+
+<Note>
+The TypeScript check (`tsc`) runs after Vite finishes. A passing build requires zero TypeScript errors. Fix any type errors before deploying.
+</Note>
+
+## Deploying
+
+<Tabs>
+  <Tab title="Vercel">
+    Vercel is the recommended deployment platform. The repository includes a `vercel.json` that configures client-side routing.
+
+    ```json title="vercel.json"
+    {
+      "routes": [{ "src": "/[^.]+", "dest": "/", "status": 200 }]
+    }
+    ```
+
+    This rule rewrites every request that is not for a static asset (identified by the absence of a `.` in the path) to `index.html`, enabling TanStack Router to handle deep-linked URLs.
+
+    <Steps>
+      <Step title="Install the Vercel CLI (optional)">
+        ```bash title="Install Vercel CLI"
+        npm i -g vercel
+        ```
+
+        You can also connect your repository directly in the [Vercel dashboard](https://vercel.com/new) without using the CLI.
+      </Step>
+
+      <Step title="Set the project root">
+        The frontend lives in `Apollo.Client/`. When importing in the Vercel dashboard, set **Root Directory** to `Apollo.Client`. The dashboard will auto-detect Vite as the framework.
+
+        If using the CLI, run it from the `Apollo.Client` directory:
+
+        ```bash title="Initialise Vercel project"
+        vercel
+        ```
+      </Step>
+
+      <Step title="Configure environment variables">
+        In the Vercel dashboard go to **Project → Settings → Environment Variables** and add:
+
+        | Name | Value |
+        |---|---|
+        | `VITE_SERVER_URL` | `https://your-apollo-api-url` |
+        | `VITE_GOOGLE_CLIENT_ID` | Your Google OAuth client ID |
+
+        Environment variables can also be passed via the CLI:
+
+        ```bash title="Deploy with env vars"
+        vercel --prod \
+          -e VITE_SERVER_URL=https://your-apollo-api-url \
+          -e VITE_GOOGLE_CLIENT_ID=your-google-client-id
+        ```
+      </Step>
+
+      <Step title="Deploy to production">
+        ```bash title="Deploy to production"
+        vercel --prod
+        ```
+
+        Vercel builds the project using the command in `package.json` (`vite build && tsc`), applies the `vercel.json` rewrite, and assigns a `.vercel.app` domain.
+      </Step>
+
+      <Step title="Add a custom domain (optional)">
+        In **Project → Settings → Domains** add your custom domain and configure the DNS records as prompted by Vercel.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Netlify">
+    Netlify supports Vite SPAs natively. You need to add a `_redirects` file to handle client-side routing — the equivalent of the `vercel.json` rewrite.
+
+    <Steps>
+      <Step title="Add a _redirects file">
+        Create `Apollo.Client/public/_redirects` with the following content:
+
+        ```text title="public/_redirects"
+        /*  /index.html  200
+        ```
+
+        This tells Netlify to serve `index.html` for all routes, allowing TanStack Router to take over.
+      </Step>
+
+      <Step title="Configure build settings">
+        In the Netlify dashboard go to **Site configuration → Build & deploy → Build settings** and set:
+
+        | Setting | Value |
+        |---|---|
+        | **Base directory** | `Apollo.Client` |
+        | **Build command** | `bun run build` or `npm run build` |
+        | **Publish directory** | `Apollo.Client/dist` |
+      </Step>
+
+      <Step title="Set environment variables">
+        In **Site configuration → Environment variables** add:
+
+        | Key | Value |
+        |---|---|
+        | `VITE_SERVER_URL` | `https://your-apollo-api-url` |
+        | `VITE_GOOGLE_CLIENT_ID` | Your Google OAuth client ID |
+      </Step>
+
+      <Step title="Deploy via drag-and-drop">
+        Build locally first:
+
+        ```bash title="Build for Netlify"
+        cd Apollo.Client
+        bun run build
+        ```
+
+        Then drag the `dist/` folder onto the Netlify dashboard **Deploys** tab for an instant manual deploy.
+      </Step>
+
+      <Step title="Or deploy via Netlify CLI">
+        ```bash title="Deploy with Netlify CLI"
+        npm i -g netlify-cli
+        netlify login
+        netlify deploy --dir=dist --prod
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Post-deployment: update the backend
+
+After the frontend is live, the backend's `CLIENT_URL` environment variable must be updated to match the new frontend URL.
+
+<Warning>
+**CORS will block all requests if `CLIENT_URL` is wrong.** The backend CORS policy only allows the exact origin set in `CLIENT_URL`. If the frontend URL changes — including adding or removing `www`, switching from `http` to `https`, or changing the domain — you must update `CLIENT_URL` on the backend and redeploy it before the frontend will work.
+</Warning>
+
+For example, if Vercel assigned `https://apollo-client.vercel.app`:
+
+1. Go to your backend hosting dashboard (Render, Azure, etc.).
+2. Update the `CLIENT_URL` environment variable to `https://apollo-client.vercel.app`.
+3. Redeploy the backend service.
+
+## Google OAuth configuration
+
+The Google OAuth client must list the frontend URL as an **Authorised JavaScript origin** in the [Google Cloud Console](https://console.cloud.google.com/):
+
+1. Open **APIs & Services → Credentials** and select your OAuth 2.0 client.
+2. Under **Authorised JavaScript origins** add your frontend URL (e.g. `https://apollo-client.vercel.app`).
+3. Save the changes. Google may take a few minutes to propagate the update.

@@ -1,97 +1,82 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Apollo — Deep Research Meta Agent"
+description: "Orchestrate a team of specialized AI agents to autonomously research any topic and generate comprehensive, cited reports."
 ---
 
-## Setting up
-
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Set up Apollo and run your first deep research query in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand how Apollo's multi-agent system works under the hood.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Self-Hosting" icon="server" href="/guides/self-hosting">
+    Deploy the backend with Docker to any cloud provider.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api-reference/research/create">
+    Explore the full REST API and SignalR real-time interface.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What is Apollo?
 
-Everything you need to create world-class documentation.
+Apollo is a multi-agent research assistant that takes a natural-language query, breaks it into fundamental research questions, and orchestrates a collaborative team of AI agents to gather, analyze, and synthesize a comprehensive research report — complete with citations.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+Unlike single-agent or tool-based approaches, Apollo uses a **dynamic group of specialized agents** managed by Microsoft Semantic Kernel's agent group chat, combined with a state machine that preserves context outside the chat window to enable complex, long-running research workflows.
 
-## Need inspiration?
+## Key capabilities
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Multi-agent orchestration" icon="users">
+    Apollo (Coordinator), Athena (Research Engine), and Hermes (Analyzer) collaborate through Semantic Kernel's agent group chat with shared context.
+  </Card>
+  <Card title="Dynamic research planning" icon="list-check">
+    No pre-defined table of contents. Apollo generates core research questions during an initial planning phase and adapts the report structure based on what it finds.
+  </Card>
+  <Card title="Self-Reflective RAG" icon="magnifying-glass-chart">
+    Hermes (the Analyzer) critiques its own knowledge gaps using Kernel Memory's structured RAG search client, then adds targeted follow-up questions until gaps are filled.
+  </Card>
+  <Card title="Two-stage synthesis" icon="layer-group">
+    Kernel Memory synthesizes section-level content, then a large-context LLM (GPT-4.1 or Gemini) produces the final structured report with consolidated citations.
+  </Card>
+  <Card title="Real-time updates" icon="bolt">
+    Research progress events stream to the frontend in real time via SignalR, powered by asynchronous .NET channels.
+  </Card>
+  <Card title="Web search & ingestion" icon="globe">
+    Exa AI provides 5–10 web results per SERP query. Kernel Memory handles chunking, embedding, and storage in PostgreSQL with pgvector.
+  </Card>
+</CardGroup>
+
+## How a research session works
+
+<Steps>
+  <Step title="Submit a query">
+    You type a research question into the Apollo frontend. The Research Planner agent analyzes the query, generates a title, description, and a set of core research questions, and saves the plan to the database.
+  </Step>
+  <Step title="Orchestration begins">
+    A research event fires on the .NET channels event bus. The Research Processor background service picks it up and instantiates a `ResearchOrchestrator`, which initializes the three-agent group chat.
+  </Step>
+  <Step title="Information gathering">
+    Apollo (Coordinator) assigns research questions to Athena (Research Engine). Athena generates 3–5 SERP queries per question, fetches results from Exa AI, and queues them for ingestion into Kernel Memory (PostgreSQL + pgvector).
+  </Step>
+  <Step title="Gap analysis">
+    Hermes (Analyzer) performs Self-Reflective RAG — querying the vector store to identify knowledge gaps and adding new questions to the queue until the research is sufficiently complete.
+  </Step>
+  <Step title="Report generation">
+    Hermes drafts and refines a Table of Contents. The Report Generation Service queries Kernel Memory per section, assembles mini-reports, and passes everything to a large-context LLM for final synthesis and citation consolidation.
+  </Step>
+</Steps>
+
+## Technology stack
+
+| Layer | Technology |
+|---|---|
+| Backend API | .NET 9, ASP.NET Core |
+| AI Agents | Microsoft Semantic Kernel |
+| Vector Memory | Kernel Memory + PostgreSQL pgvector |
+| Web Search | Exa AI |
+| LLM Models | Azure OpenAI GPT-4.1, Google Gemini |
+| Real-time | SignalR |
+| Frontend | React (Vite), TanStack Router & Query |
+| Auth | JWT, Google OAuth |
+| Deployment | Docker, Render.com / Azure |

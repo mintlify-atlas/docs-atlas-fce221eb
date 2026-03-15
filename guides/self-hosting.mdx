@@ -1,0 +1,278 @@
+---
+title: "Self-hosting with Docker"
+description: "Deploy the Apollo backend API using the included Dockerfile on Render.com or Azure App Service."
+---
+
+Apollo ships with a production-ready, multi-stage `Dockerfile` that compiles the .NET 9 solution and produces a lean runtime image based on `mcr.microsoft.com/dotnet/aspnet:9.0`. This guide walks through building the image locally and deploying it to the two most common hosting targets.
+
+## The Dockerfile
+
+The build is split into two stages to keep the final image as small as possible.
+
+```dockerfile title="Dockerfile"
+# Stage 1: Build the .NET application
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /source
+
+# Copy solution and project files first for layer caching
+COPY *.sln .
+COPY Apollo.Api/*.csproj ./Apollo.Api/
+COPY Apollo.Agents/*.csproj ./Apollo.Agents/
+COPY Apollo.Config/*.csproj ./Apollo.Config/
+COPY Apollo.Data/*.csproj ./Apollo.Data/
+COPY Apollo.Search/*.csproj ./Apollo.Search/
+COPY Apollo.Notifications/*.csproj ./Apollo.Notifications/
+
+# Restore dependencies for the entire solution
+RUN dotnet restore "./Apollo.sln"
+
+# Copy the rest of the source code
+COPY . .
+
+# Publish the API project in Release configuration
+WORKDIR /source/Apollo.Api
+RUN dotnet publish -c Release -o /app/publish --no-restore
+
+# Stage 2: Create the final runtime image
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+WORKDIR /app
+
+# Copy the published application from the build stage
+COPY --from=build /app/publish .
+
+# ASP.NET Core listens on all interfaces on port 80
+ENV ASPNETCORE_URLS=http://+:80
+ENV ASPNETCORE_ENVIRONMENT=Production
+
+EXPOSE 80
+
+ENTRYPOINT ["dotnet", "Apollo.Api.dll"]
+```
+
+**Stage breakdown:**
+
+| Stage | Base image | Purpose |
+|---|---|---|
+| `build` | `dotnet/sdk:9.0` | Restores NuGet packages and publishes a Release build |
+| `final` | `dotnet/aspnet:9.0` | Minimal runtime-only image — no SDK overhead |
+
+Project `.csproj` files are copied before the full source so that `dotnet restore` is cached by Docker and only re-runs when a project file changes.
+
+## Building the image
+
+Run the following from the repository root (where the `Dockerfile` lives):
+
+```bash title="Build the Docker image"
+docker build -t apollo-api .
+```
+
+To tag a specific version:
+
+```bash title="Build with a version tag"
+docker build -t apollo-api:1.0.0 .
+```
+
+## Required environment variables
+
+Before running the container you must supply the following environment variables. See [Environment Variables](/configuration/environment-variables) for the full reference.
+
+| Variable | Description |
+|---|---|
+| `CLIENT_URL` | Full URL of the deployed frontend (e.g. `https://app.example.com`). Used by the CORS policy. |
+| `CONNECTION_STRING` | PostgreSQL connection string for the Apollo database |
+| `JWT_SECRET` | Secret key used to sign JSON Web Tokens |
+| `AZURE_AI_ENDPOINT` | Azure AI Inference or OpenAI-compatible endpoint |
+| `AZURE_AI_KEY` | API key for the AI endpoint |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID (must match the frontend value) |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+
+## Running the container locally
+
+```bash title="Run the container"
+docker run -d \
+  --name apollo-api \
+  -p 8080:80 \
+  -e CLIENT_URL="http://localhost:3000" \
+  -e CONNECTION_STRING="Host=localhost;Database=apollo;Username=postgres;Password=secret" \
+  -e JWT_SECRET="your-jwt-secret" \
+  -e AZURE_AI_ENDPOINT="https://your-endpoint.openai.azure.com/" \
+  -e AZURE_AI_KEY="your-azure-ai-key" \
+  -e GOOGLE_CLIENT_ID="your-google-client-id" \
+  -e GOOGLE_CLIENT_SECRET="your-google-client-secret" \
+  apollo-api
+```
+
+The API will be available at `http://localhost:8080`.
+
+<Note>
+SignalR uses long-polling as a fallback when WebSockets are unavailable. Make sure your reverse proxy or load balancer does not terminate long-lived connections too aggressively. Set an idle timeout of at least 60 seconds.
+</Note>
+
+## CORS configuration
+
+The CORS policy in `Program.cs` reads `CLIENT_URL` at startup and restricts `AllowedOrigins` to that single value:
+
+```csharp title="Apollo.Api/Program.cs — CORS policy"
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(
+        "apollo",
+        policy =>
+        {
+            policy
+                .WithOrigins(AppConfig.Client.Url)   // reads CLIENT_URL
+                .AllowAnyMethod()
+                .AllowAnyHeader()
+                .AllowCredentials();                 // required for SignalR
+        }
+    );
+});
+```
+
+<Warning>
+If you change the frontend URL after initial deployment, you **must** update `CLIENT_URL` on the backend and redeploy. A mismatched origin will block all API requests and the SignalR connection.
+</Warning>
+
+## Deploying to a cloud provider
+
+<Tabs>
+  <Tab title="Render.com">
+    Render natively supports Docker deployments and injects a `PORT` environment variable at runtime. Apollo's `Dockerfile` is already configured for this — `ASPNETCORE_URLS=http://+:80` causes ASP.NET Core to bind to whatever port Render forwards traffic to.
+
+    <Steps>
+      <Step title="Push your image to a registry">
+        Render can build directly from your Git repository, or you can push to Docker Hub or a private registry. For the simplest path, connect Render to your GitHub repo.
+      </Step>
+
+      <Step title="Create a new Web Service">
+        1. In the Render dashboard click **New → Web Service**.
+        2. Connect your GitHub repository.
+        3. Set **Environment** to **Docker**.
+        4. Render automatically detects the `Dockerfile` at the repository root.
+      </Step>
+
+      <Step title="Configure the service">
+        Set the following in the **Environment** tab:
+
+        | Key | Value |
+        |---|---|
+        | `CLIENT_URL` | Your frontend URL (add after frontend deployment) |
+        | `CONNECTION_STRING` | Your PostgreSQL URL |
+        | `JWT_SECRET` | A strong random secret |
+        | `AZURE_AI_ENDPOINT` | Your Azure AI endpoint |
+        | `AZURE_AI_KEY` | Your Azure AI key |
+        | `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+        | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+
+        Under **Advanced**, set the **Health Check Path** to `/` (a GET to the root returns a 200 from the Scalar API reference in production, or you can rely on the default TCP check).
+      </Step>
+
+      <Step title="Add a PostgreSQL database">
+        Click **New → PostgreSQL** to provision a managed database. Copy the **Internal Connection String** and paste it as the `CONNECTION_STRING` environment variable on the Web Service.
+      </Step>
+
+      <Step title="Deploy">
+        Click **Create Web Service**. Render builds the Docker image and starts the container. The service URL (e.g. `https://apollo-api.onrender.com`) is displayed on the dashboard once the deploy succeeds.
+      </Step>
+
+      <Step title="Update CLIENT_URL">
+        After deploying the frontend, come back and update `CLIENT_URL` to the live frontend URL, then click **Manual Deploy → Deploy latest commit** to apply the change.
+      </Step>
+    </Steps>
+
+    <Tip>
+      Render's free tier spins down inactive services after 15 minutes of inactivity. Use a paid plan or a keep-alive ping service for production workloads where SignalR connections must stay alive.
+    </Tip>
+  </Tab>
+
+  <Tab title="Azure App Service">
+    Azure App Service supports Docker containers via its **Web App for Containers** offering.
+
+    <Steps>
+      <Step title="Push the image to Azure Container Registry">
+        ```bash title="Push image to ACR"
+        # Create a registry (one-time)
+        az acr create --resource-group myRG --name myacrname --sku Basic
+
+        # Log in
+        az acr login --name myacrname
+
+        # Tag and push
+        docker tag apollo-api myacrname.azurecr.io/apollo-api:latest
+        docker push myacrname.azurecr.io/apollo-api:latest
+        ```
+      </Step>
+
+      <Step title="Create the App Service Plan">
+        ```bash title="Create App Service Plan"
+        az appservice plan create \
+          --name apollo-plan \
+          --resource-group myRG \
+          --is-linux \
+          --sku B2
+        ```
+      </Step>
+
+      <Step title="Create the Web App">
+        ```bash title="Create Web App for Containers"
+        az webapp create \
+          --resource-group myRG \
+          --plan apollo-plan \
+          --name apollo-api \
+          --deployment-container-image-name myacrname.azurecr.io/apollo-api:latest
+        ```
+      </Step>
+
+      <Step title="Configure environment variables">
+        ```bash title="Set app settings"
+        az webapp config appsettings set \
+          --resource-group myRG \
+          --name apollo-api \
+          --settings \
+            CLIENT_URL="https://your-frontend.vercel.app" \
+            CONNECTION_STRING="your-connection-string" \
+            JWT_SECRET="your-jwt-secret" \
+            AZURE_AI_ENDPOINT="https://your-endpoint.openai.azure.com/" \
+            AZURE_AI_KEY="your-key" \
+            GOOGLE_CLIENT_ID="your-client-id" \
+            GOOGLE_CLIENT_SECRET="your-client-secret"
+        ```
+      </Step>
+
+      <Step title="Enable WebSockets">
+        SignalR requires WebSocket support. Enable it on the App Service:
+
+        ```bash title="Enable WebSockets"
+        az webapp config set \
+          --resource-group myRG \
+          --name apollo-api \
+          --web-sockets-enabled true
+        ```
+      </Step>
+
+      <Step title="Configure ACR credentials">
+        Grant the App Service permission to pull from your container registry:
+
+        ```bash title="Assign ACR pull role"
+        az webapp identity assign \
+          --resource-group myRG \
+          --name apollo-api
+
+        # Then grant AcrPull to the managed identity
+        az role assignment create \
+          --assignee <principal-id> \
+          --scope $(az acr show --name myacrname --query id -o tsv) \
+          --role AcrPull
+        ```
+      </Step>
+
+      <Step title="Verify deployment">
+        Navigate to `https://apollo-api.azurewebsites.net`. You should receive a valid HTTP response. Update `CLIENT_URL` to your frontend URL once deployed.
+      </Step>
+    </Steps>
+
+    <Note>
+      Azure App Service on the Basic (B) tier supports WebSockets. Do not use the Free (F1) or Shared (D1) tiers for Apollo — they do not support WebSockets and SignalR will fall back to long-polling only.
+    </Note>
+  </Tab>
+</Tabs>

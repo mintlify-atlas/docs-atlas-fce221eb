@@ -1,0 +1,153 @@
+---
+title: "Azure AI configuration"
+description: "How to provision an Azure AI Foundry resource, deploy GPT-4.1, and wire the endpoint and API key into Apollo."
+keywords: ["azure ai", "azure openai", "gpt-4.1", "foundry", "chat completion", "semantic kernel"]
+---
+
+Apollo uses Azure AI Foundry (Azure OpenAI Service) as its primary LLM provider. Every named agent — Apollo (Research Coordinator), Athena (Research Engine), and Hermes (Research Analyzer) — calls `AddAzureOpenAIChatCompletion` on the Semantic Kernel builder at orchestration time. The same endpoint and API key are also used by Kernel Memory for text embedding (`text-embedding-3-small`) and for per-section text generation during the synthesis stage.
+
+Two environment variables connect Apollo to your Azure AI resource:
+
+| Variable | Purpose |
+|---|---|
+| `AZURE_AI_API_KEY` | Authenticates API calls to your Azure OpenAI resource |
+| `AZURE_AI_ENDPOINT` | The HTTPS base URL for your deployment (e.g., `https://my-resource.openai.azure.com/`) |
+
+<Note>
+  Apollo targets **Azure AI Foundry** (the unified Azure AI platform), not the standalone Azure OpenAI Service. The two share the same API surface, but Foundry provides a project-level workspace with model deployment management, monitoring, and quota controls in a single place. The API key and endpoint format are identical for both entry points.
+</Note>
+
+## How Apollo uses Azure AI
+
+Apollo reads these two variables in `AppConfig.AzureAI` at startup. They are consumed in two places in the agent layer:
+
+**Agent orchestration** — `ResearchOrchestrator.StartResearchProcessAsync` builds a Semantic Kernel instance and registers Azure OpenAI chat completion before creating any agents:
+
+```csharp ResearchOrchestrator.cs
+var kernelBuilder = Kernel.CreateBuilder();
+
+kernelBuilder.AddAzureOpenAIChatCompletion(
+    deploymentName: AppConfig.Models.Gpt41,   // "gpt-4.1"
+    endpoint: AppConfig.AzureAI.Endpoint,
+    apiKey: AppConfig.AzureAI.ApiKey
+);
+```
+
+All three agents (Coordinator, Engine, Analyzer) share a kernel built from the same `kernelBuilder`, so they all route calls through this registration.
+
+**Kernel Memory** — `MemoryContext` also uses the same credentials for both embedding generation and text-generation tasks within the RAG pipeline:
+
+```csharp MemoryContext.cs
+new KernelMemoryBuilder()
+    .WithAzureOpenAITextEmbeddingGeneration(new()
+    {
+        Auth       = AzureOpenAIConfig.AuthTypes.APIKey,
+        APIKey     = AppConfig.AzureAI.ApiKey,
+        Deployment = AppConfig.Models.TextEmbeddingSmall,  // "text-embedding-3-small"
+        Endpoint   = AppConfig.AzureAI.Endpoint,
+        EmbeddingDimensions = 1536,
+    })
+    .WithAzureOpenAITextGeneration(new()
+    {
+        Auth          = AzureOpenAIConfig.AuthTypes.APIKey,
+        APIKey        = AppConfig.AzureAI.ApiKey,
+        Deployment    = AppConfig.Models.Gpt41,            // "gpt-4.1"
+        Endpoint      = AppConfig.AzureAI.Endpoint,
+        MaxTokenTotal = 1047576,
+    })
+```
+
+## Model deployments
+
+Apollo expects the following model deployments to exist in your Azure AI Foundry project:
+
+| `AppConfig.Models` property | Deployment name | Usage |
+|---|---|---|
+| `Gpt41` | `gpt-4.1` | Agent chat completions (all three agents), Kernel Memory text generation, final report synthesis |
+| `TextEmbeddingSmall` | `text-embedding-3-small` | Kernel Memory embedding generation |
+
+The deployment names are hard-coded in `AppConfig.Models` — you must use exactly these names when you create the deployments in Azure AI Foundry, or the Semantic Kernel calls will fail with a `404 DeploymentNotFound` error.
+
+```csharp AppConfig.cs
+public static Models Models { get; } =
+    new()
+    {
+        Gpt41               = "gpt-4.1",
+        TextEmbeddingSmall  = "text-embedding-3-small",
+        GeminiProFlash25    = "gemini-2.5-flash-preview-04-17",
+        GptO4mini           = "o4-mini",
+    };
+```
+
+## Setting up Azure AI Foundry
+
+<Steps>
+  <Step title="Create an Azure AI Foundry hub">
+    Open the [Azure AI Foundry portal](https://ai.azure.com) and sign in with your Azure account.
+
+    Click **Create new hub**. Choose a subscription, resource group, region, and a unique hub name. Select a region that has quota for GPT-4.1 (for example, `East US 2` or `Sweden Central`).
+
+    Wait for the hub to finish provisioning before continuing.
+  </Step>
+
+  <Step title="Create a project inside the hub">
+    Inside your new hub, click **New project**. Give it a name such as `apollo`. A project is the logical container for deployments, experiments, and connections.
+  </Step>
+
+  <Step title="Deploy GPT-4.1">
+    In the left sidebar, navigate to **Model catalog** → **Deploy model**.
+
+    Search for `gpt-4.1`. Select it, click **Deploy**, and set the **Deployment name** to exactly `gpt-4.1`. Choose a token-per-minute (TPM) capacity that suits your workload — Apollo's multi-agent research sessions can generate substantial token volume, so a higher TPM quota is recommended.
+
+    Repeat with `text-embedding-3-small`, setting the deployment name to exactly `text-embedding-3-small`.
+  </Step>
+
+  <Step title="Retrieve the endpoint and API key">
+    In the Azure portal, navigate to your **Azure OpenAI resource** (the underlying resource backing your Foundry hub).
+
+    Open **Keys and Endpoint** in the left sidebar. You will see:
+
+    - **Key 1** / **Key 2** — copy either one. This is your `AZURE_AI_API_KEY`.
+    - **Endpoint** — the HTTPS URL ending in `.openai.azure.com/`. This is your `AZURE_AI_ENDPOINT`.
+
+    Alternatively, inside the AI Foundry portal, open your project and navigate to **Settings** → **Project settings**. The endpoint and key are listed under **Azure OpenAI**.
+  </Step>
+
+  <Step title="Set the environment variables">
+    Add both values to `Apollo.Api/.env`:
+
+    ```env Apollo.Api/.env
+    AZURE_AI_API_KEY=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+    AZURE_AI_ENDPOINT=https://my-apollo-resource.openai.azure.com/
+    ```
+
+    In production (Docker or a managed platform), inject these as environment variables rather than committing the file.
+  </Step>
+</Steps>
+
+## Gemini for final synthesis
+
+The final report synthesis step — where all per-section research is assembled into the complete document — also supports Google Gemini (`gemini-2.5-flash-preview-04-17`) via `GOOGLE_AI_API_KEY`. In `ResearchReportGenerator`, the Gemini registration is present in the code but currently commented out in favour of continuing to use the GPT-4.1 deployment:
+
+```csharp ResearchReportGenerator.cs
+var kernel = Kernel
+    .CreateBuilder()
+    .AddAzureOpenAIChatCompletion(
+        deploymentName: AppConfig.Models.Gpt41,
+        endpoint: AppConfig.AzureAI.Endpoint,
+        apiKey: AppConfig.AzureAI.ApiKey,
+        httpClient: httpClient
+    )
+    // .AddGoogleAIGeminiChatCompletion(
+    //     modelId: AppConfig.Models.GeminiProFlash25,
+    //     apiKey: AppConfig.Google.ApiKey,
+    //     httpClient: httpClient
+    // )
+    .Build();
+```
+
+To switch to Gemini for the final synthesis, comment out the `AddAzureOpenAIChatCompletion` call and uncomment the `AddGoogleAIGeminiChatCompletion` call. Both registrations require their respective environment variables to be set regardless of which is active.
+
+<Tip>
+  GPT-4.1 has a large context window (up to ~1M tokens in the Kernel Memory configuration) and tends to produce consistent structured output. Gemini 2.5 Flash is a strong alternative for the synthesis stage because it is optimized for long-context reasoning and is more cost-efficient at high token counts. Try both and compare quality for your use case.
+</Tip>

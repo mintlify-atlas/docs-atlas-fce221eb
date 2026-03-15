@@ -1,0 +1,135 @@
+---
+title: "Get research updates"
+description: "Retrieve cached real-time events for an in-progress research session. Use this to catch up on missed events after reconnecting."
+---
+
+<Badge color="green">GET</Badge> `/api/research/{researchId}/updates`
+
+Returns the feed updates and agent chat messages that have been accumulated in server-side state for the given research session. This endpoint is intended for **reconnecting clients** that need to replay events they missed while disconnected from the [SignalR research hub](/api-reference/signalr/research-hub).
+
+<Note>
+  Updates are only returned while the research session has a status of `InProgress`. If the session is `Complete`, both lists are returned empty. Connect to the [research hub](/api-reference/signalr/research-hub) for live events during an active session.
+</Note>
+
+## Authentication
+
+Required. The request must include the `apollo_access_token` HTTP-only cookie. The requesting user must own the research session.
+
+---
+
+## Path parameters
+
+<ParamField path="researchId" type="string" required>
+  UUID of the research session whose cached updates you want to retrieve.
+</ParamField>
+
+---
+
+## Response
+
+Returns a `ResearchUpdatesResponse` object on success (`200 OK`).
+
+<ResponseField name="feedUpdates" type="object[]" required>
+  Ordered list of feed update events that were emitted since the research session started. Each item is a polymorphic `ResearchFeedUpdateEvent` — see the [research hub documentation](/api-reference/signalr/research-hub) for the full shape of each event subtype.
+  <Expandable title="common feed update fields">
+    <ResponseField name="researchId" type="string" required>
+      UUID of the research session this event belongs to.
+    </ResponseField>
+    <ResponseField name="timestamp" type="string" required>
+      ISO 8601 UTC timestamp of when the event was emitted.
+    </ResponseField>
+    <ResponseField name="type" type="string" required>
+      Discriminator for the event subtype. One of `"Message"`, `"Searching"`, `"SearchResults"`, `"Snippet"`, or `"TableOfContents"`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="chatMessages" type="object[]" required>
+  Ordered list of agent chat messages emitted during the session.
+  <Expandable title="chat message fields">
+    <ResponseField name="researchId" type="string" required>
+      UUID of the research session this message belongs to.
+    </ResponseField>
+    <ResponseField name="timestamp" type="string" required>
+      ISO 8601 UTC timestamp of when the message was emitted.
+    </ResponseField>
+    <ResponseField name="author" type="string" required>
+      Identifier of the agent or component that produced the message.
+    </ResponseField>
+    <ResponseField name="message" type="string" required>
+      The text content of the agent message.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Reconnection pattern
+
+When your client reconnects to the SignalR hub after a drop, call this endpoint before re-joining the group to replay any events that were missed:
+
+<Steps>
+  <Step title="Reconnect to the hub">
+    Re-establish the SignalR connection to `/hubs/research`.
+  </Step>
+  <Step title="Fetch missed updates">
+    Call `GET /api/research/{researchId}/updates` to retrieve all cached events.
+  </Step>
+  <Step title="Replay events in the UI">
+    Process `feedUpdates` and `chatMessages` in order to restore UI state.
+  </Step>
+  <Step title="Join the stream">
+    Call `JoinResearchStream` on the hub to start receiving new live events.
+  </Step>
+</Steps>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `401 Unauthorized` | No valid session cookie was sent, or the session has expired. |
+| `404 Not Found` | No research session with the given ID exists, or it belongs to a different user. |
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request GET \
+  --url https://your-apollo-instance.com/api/research/3fa85f64-5717-4562-b3fc-2c963f66afa6/updates \
+  --cookie 'apollo_access_token=<your-token>'
+```
+
+```typescript TypeScript
+const researchId = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+
+const response = await fetch(`/api/research/${researchId}/updates`, {
+  method: 'GET',
+  credentials: 'include',
+});
+
+if (response.status === 404) {
+  console.error('Research not found or access denied');
+} else if (!response.ok) {
+  throw new Error(`Unexpected status ${response.status}`);
+} else {
+  const { feedUpdates, chatMessages } = await response.json();
+
+  // Replay cached events to restore UI state
+  for (const event of feedUpdates) {
+    applyFeedUpdate(event);
+  }
+  for (const msg of chatMessages) {
+    appendChatMessage(msg);
+  }
+
+  // Now safe to join the live stream
+  await hubConnection.invoke('JoinResearchStream', researchId);
+}
+```
+
+</CodeGroup>

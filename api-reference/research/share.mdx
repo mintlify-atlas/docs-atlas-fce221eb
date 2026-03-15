@@ -1,0 +1,96 @@
+---
+title: "Get shared report"
+description: "Retrieve a published research report by its report ID. This endpoint is public and requires no authentication."
+---
+
+<Badge color="green">GET</Badge> `/api/research/share/{reportId}`
+
+Returns the content of a published research report. This is the only research endpoint that does **not** require authentication, making it suitable for sharing reports with users who do not have an Apollo account.
+
+## Authentication
+
+None required. This endpoint is public.
+
+<Tip>
+  The `reportId` is the UUID found on the `report.id` field of a completed research session. Retrieve it from [Get research](/api-reference/research/get) or [List research](/api-reference/research/list) after the session reaches `Complete` status.
+</Tip>
+
+---
+
+## Sharing workflow
+
+<Steps>
+  <Step title="Start and complete a research session">
+    Create a session with [Create research](/api-reference/research/create) and wait for the `ResearchCompleted` event on the [SignalR hub](/api-reference/signalr/research-hub), or poll [Get research](/api-reference/research/get) until `status` is `"Complete"`.
+  </Step>
+  <Step title="Obtain the report ID">
+    Read the `report.id` field from the completed research response.
+  </Step>
+  <Step title="Distribute the report URL">
+    Share the URL `https://your-apollo-instance.com/api/research/share/{reportId}` — anyone with the link can access the report without signing in.
+  </Step>
+</Steps>
+
+---
+
+## Path parameters
+
+<ParamField path="reportId" type="string" required>
+  UUID of the report to retrieve. This is the `id` field from the `report` object on a completed research session.
+</ParamField>
+
+---
+
+## Response
+
+Returns a `SharedResearchReportResponse` object on success (`200 OK`).
+
+<ResponseField name="id" type="string" required>
+  UUID of the report record.
+</ResponseField>
+
+<ResponseField name="title" type="string" required>
+  Title of the parent research session.
+</ResponseField>
+
+<ResponseField name="content" type="string" required>
+  Full Markdown content of the generated report.
+</ResponseField>
+
+---
+
+## Error responses
+
+| Status | When it occurs |
+|--------|----------------|
+| `404 Not Found` | No report with the given ID exists. |
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```bash cURL
+curl --request GET \
+  --url https://your-apollo-instance.com/api/research/share/7c9e6679-7425-40de-944b-e07fc1f90ae7
+```
+
+```typescript TypeScript
+const reportId = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
+
+// No credentials needed — this endpoint is public
+const response = await fetch(`/api/research/share/${reportId}`);
+
+if (response.status === 404) {
+  console.error('Report not found');
+} else if (!response.ok) {
+  throw new Error(`Unexpected status ${response.status}`);
+} else {
+  const report = await response.json();
+  console.log(report.title);
+  renderMarkdown(report.content);
+}
+```
+
+</CodeGroup>
