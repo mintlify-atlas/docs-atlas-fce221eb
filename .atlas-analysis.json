@@ -1,0 +1,107 @@
+{
+  "projectType": "saas",
+  "projectName": "Apollo",
+  "projectDescription": "A deep research meta-agent that orchestrates a team of specialized AI agents to autonomously gather, analyze, and synthesize comprehensive research reports from user queries.",
+  "theme": "palm",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "deployment"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/agents",
+              "concepts/research-flow",
+              "concepts/memory-rag"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/azure-ai",
+              "configuration/database"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/self-hosting",
+              "guides/frontend-deployment",
+              "guides/realtime-updates"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Authentication",
+            "pages": [
+              "api-reference/auth/signup",
+              "api-reference/auth/signin",
+              "api-reference/auth/google-signup",
+              "api-reference/auth/me"
+            ]
+          },
+          {
+            "group": "Research",
+            "pages": [
+              "api-reference/research/create",
+              "api-reference/research/get",
+              "api-reference/research/list",
+              "api-reference/research/history",
+              "api-reference/research/updates",
+              "api-reference/research/share"
+            ]
+          },
+          {
+            "group": "Real-time",
+            "pages": [
+              "api-reference/signalr/research-hub"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-agent orchestration with Apollo (Coordinator), Athena (Research Engine), and Hermes (Analyzer)",
+    "Dynamic research planning — generates core questions and adapts report structure based on findings",
+    "Self-Reflective RAG via Kernel Memory to identify and fill knowledge gaps",
+    "Two-stage synthesis: Kernel Memory for section content + large-context LLM (GPT-4.1/Gemini) for final report",
+    "Real-time research progress updates via SignalR and .NET channels",
+    "Exa AI integration for web search and content retrieval",
+    "PostgreSQL + pgvector for vector storage and semantic search",
+    "JWT and Google OAuth authentication",
+    "Shareable research reports via public links",
+    "Dockerized backend deployable to Render.com or Azure"
+  ],
+  "publicApiSurface": [
+    "POST /api/auth/signup",
+    "POST /api/auth/signin",
+    "POST /api/auth/google-signup",
+    "GET /api/auth/me",
+    "POST /api/research",
+    "GET /api/research",
+    "GET /api/research/{researchId}",
+    "GET /api/research/history",
+    "GET /api/research/{researchId}/updates",
+    "GET /api/research/share/{reportId}",
+    "SignalR Hub: /hubs/research"
+  ]
+}
